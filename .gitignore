@@ -1,0 +1,7 @@
+/target
+*.exe
+*.pdb
+tasks.txt
+floatdo_debug.log
+floatdo_tray_diag.log
+floatdo_drag_diag.log
