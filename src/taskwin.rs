@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, SetCapture, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
@@ -107,6 +107,7 @@ pub fn show_current() {
             ShowWindow(st.hwnd, SW_SHOW);
             SetForegroundWindow(st.hwnd);
             SetFocus(st.hwnd);
+            update_caret(st.hwnd, st);
         }
     }
 }
@@ -114,6 +115,7 @@ pub fn show_current() {
 pub fn hide_current() {
     unsafe {
         if !TASKWIN.is_null() {
+            let _ = DestroyCaret();
             ShowWindow((*TASKWIN).hwnd, SW_HIDE);
         }
     }
@@ -133,15 +135,71 @@ fn scroll_max(content_len: usize, view_top: i32) -> i32 {
     (content_h - view_h).max(0)
 }
 
+/// 鼠标是否位于某张任务卡片的勾选圈或删除按钮上（用于切换手形光标）。
+fn over_card_action(s: &TaskWinState, x: i32, y: i32) -> bool {
+    let count = s.store.lock().unwrap().all().len() as i32;
+    let top = list_top(s) - s.scroll_y;
+    for idx in 0..count {
+        let y0 = top + idx * (CARD_H + CARD_GAP);
+        if y >= y0 && y <= y0 + CARD_H {
+            return (x >= MARGIN_X + 15 && x <= MARGIN_X + 15 + 22)
+                || (x >= WIN_W - MARGIN_X - 24 - 12 && x <= WIN_W - MARGIN_X);
+        }
+    }
+    false
+}
+
+/// 在输入框文本末尾显示/更新系统插入光标（闪烁由系统驱动）。
+unsafe fn update_caret(hwnd: HWND, s: &TaskWinState) {
+    if !s.input_visible || GetFocus() != hwnd {
+        let _ = DestroyCaret();
+        return;
+    }
+    let hdc = GetDC(hwnd);
+    let old = SelectObject(hdc, s.font_item);
+    let mut sz = SIZE::default();
+    let wide: Vec<u16> = s.input_buffer.encode_utf16().collect();
+    if !wide.is_empty() {
+        GetTextExtentPoint32W(hdc, &wide, &mut sz);
+    }
+    SelectObject(hdc, old);
+    ReleaseDC(hwnd, hdc);
+
+    let h = if sz.cy > 0 { sz.cy } else { 20 };
+    let left = 20 + 12;
+    let right = WIN_W - 20 - 12;
+    let x = (left + sz.cx).clamp(left, right - 1);
+    let y = TITLE_H + HEADER_H + (INPUT_H - h) / 2;
+
+    let _ = CreateCaret(hwnd, HBITMAP(std::ptr::null_mut()), 1, h);
+    let _ = SetCaretPos(x, y);
+    let _ = ShowCaret(hwnd);
+}
+
 unsafe extern "system" fn task_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if TASKWIN.is_null() {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
     match msg {
         WM_PAINT => {
             paint(hwnd);
+            LRESULT(0)
+        }
+        WM_SETFOCUS => {
+            update_caret(hwnd, st());
+            LRESULT(0)
+        }
+        WM_KILLFOCUS => {
+            let _ = DestroyCaret();
+            LRESULT(0)
+        }
+        WM_MOVE => {
+            update_caret(hwnd, st());
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -164,11 +222,13 @@ unsafe extern "system" fn task_wndproc(
             if p.y < TITLE_H + HEADER_H && p.x > WIN_W - 60 {
                 s.input_visible = !s.input_visible;
                 if s.input_visible { s.input_buffer.clear(); }
-                InvalidateRect(hwnd, None, TRUE);
+                InvalidateRect(hwnd, None, false);
+                update_caret(hwnd, s);
                 return LRESULT(0);
             }
             if s.input_visible && p.y >= TITLE_H + HEADER_H && p.y < TITLE_H + HEADER_H + INPUT_H {
                 SetFocus(hwnd);
+                update_caret(hwnd, s);
                 return LRESULT(0);
             }
             let top = list_top(s) - s.scroll_y;
@@ -181,13 +241,13 @@ unsafe extern "system" fn task_wndproc(
                     if p.x >= MARGIN_X + 15 && p.x <= MARGIN_X + 15 + 22 {
                         let id = task.id.clone();
                         s.store.lock().unwrap().toggle(&id);
-                        InvalidateRect(hwnd, None, TRUE);
+                        InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
                     if p.x >= WIN_W - MARGIN_X - 24 - 12 && p.x <= WIN_W - MARGIN_X {
                         let id = task.id.clone();
                         s.store.lock().unwrap().delete(&id);
-                        InvalidateRect(hwnd, None, TRUE);
+                        InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
                 }
@@ -206,6 +266,28 @@ unsafe extern "system" fn task_wndproc(
             }
             LRESULT(0)
         }
+        WM_SETCURSOR => {
+            if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
+                let s = st();
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                let _ = ScreenToClient(hwnd, &mut p);
+                let icon = if p.y < TITLE_H {
+                    if p.x <= 45 { IDC_HAND } else { IDC_ARROW }
+                } else if p.y < TITLE_H + HEADER_H {
+                    if p.x > WIN_W - 60 { IDC_HAND } else { IDC_ARROW }
+                } else if s.input_visible && p.y < TITLE_H + HEADER_H + INPUT_H {
+                    IDC_IBEAM
+                } else if over_card_action(s, p.x, p.y) {
+                    IDC_HAND
+                } else {
+                    IDC_ARROW
+                };
+                SetCursor(LoadCursorW(None, icon).unwrap_or_default());
+                return LRESULT(1);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_LBUTTONUP => {
             st().dragging = false;
             ReleaseCapture();
@@ -217,7 +299,7 @@ unsafe extern "system" fn task_wndproc(
             let step = -delta / 120 * (CARD_H + CARD_GAP);
             let maxs = scroll_max(s.store.lock().unwrap().all().len(), list_top(s));
             s.scroll_y = (s.scroll_y + step).clamp(0, maxs);
-            InvalidateRect(hwnd, None, TRUE);
+            InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
         WM_CHAR => {
@@ -232,22 +314,26 @@ unsafe extern "system" fn task_wndproc(
                         }
                         s.input_buffer.clear();
                         s.input_visible = false;
-                        InvalidateRect(hwnd, None, TRUE);
+                        InvalidateRect(hwnd, None, false);
+                        update_caret(hwnd, s);
                     }
                     8 => {
                         s.input_buffer.pop();
-                        InvalidateRect(hwnd, None, TRUE);
+                        invalidate_input(hwnd);
+                        update_caret(hwnd, s);
                     }
                     27 => {
                         s.input_buffer.clear();
                         s.input_visible = false;
-                        InvalidateRect(hwnd, None, TRUE);
+                        InvalidateRect(hwnd, None, false);
+                        update_caret(hwnd, s);
                     }
                     _ => {
                         if let Some(ch) = char::from_u32(c) {
                             if !ch.is_control() {
                                 s.input_buffer.push(ch);
-                                InvalidateRect(hwnd, None, TRUE);
+                                invalidate_input(hwnd);
+                                update_caret(hwnd, s);
                             }
                         }
                     }
@@ -261,44 +347,61 @@ unsafe extern "system" fn task_wndproc(
     }
 }
 
+/// 打字时只需重绘输入框那一条区域，任务列表保持原样，避免整窗闪烁。
+unsafe fn invalidate_input(hwnd: HWND) {
+    let rc = RECT {
+        left: 0,
+        top: TITLE_H + HEADER_H,
+        right: WIN_W,
+        bottom: TITLE_H + HEADER_H + INPUT_H,
+    };
+    InvalidateRect(hwnd, Some(&rc), false);
+}
+
 unsafe fn paint(hwnd: HWND) {
     let s = st();
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
+    let _ = HideCaret(hwnd);
+
+    // 双缓冲：先画入内存位图，最后一次性拷贝上屏，避免逐项绘制时闪烁
+    let mem = CreateCompatibleDC(hdc);
+    let bmp = CreateCompatibleBitmap(hdc, WIN_W, WIN_H);
+    let old_bmp = SelectObject(mem, bmp);
 
     let full = RECT { left: 0, top: 0, right: WIN_W, bottom: WIN_H };
     let bg = CreateSolidBrush(rgb(C_WHITE.0, C_WHITE.1, C_WHITE.2));
-    FillRect(hdc, &full, bg);
+    FillRect(mem, &full, bg);
     DeleteObject(bg);
 
     // 标题栏
     let title_rc = RECT { left: 0, top: 0, right: WIN_W, bottom: TITLE_H };
-    gdi::draw_text(hdc, "待办事项", title_rc, rgb(C_MUTED.0, C_MUTED.1, C_MUTED.2),
+    gdi::draw_text(mem, "待办事项", title_rc, rgb(C_MUTED.0, C_MUTED.1, C_MUTED.2),
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, s.font_header);
     let close_rc = RECT { left: 0, top: 0, right: 45, bottom: TITLE_H };
-    gdi::draw_text(hdc, "×", close_rc, rgb(C_MUTED.0, C_MUTED.1, C_MUTED.2),
+    gdi::draw_text(mem, "×", close_rc, rgb(C_MUTED.0, C_MUTED.1, C_MUTED.2),
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, s.font_btn);
 
     // header
     let hdr_y = TITLE_H;
     let hdr_title = RECT { left: 20, top: hdr_y, right: 200, bottom: hdr_y + HEADER_H };
-    gdi::draw_text(hdc, "我的待办", hdr_title, rgb(C_TEXT.0, C_TEXT.1, C_TEXT.2),
+    gdi::draw_text(mem, "我的待办", hdr_title, rgb(C_TEXT.0, C_TEXT.1, C_TEXT.2),
         DT_LEFT | DT_VCENTER | DT_SINGLELINE, s.font_title);
     let add_rc = RECT { left: WIN_W - 20 - 36, top: hdr_y + 10, right: WIN_W - 20, bottom: hdr_y + 10 + 36 };
     // 直接贴 ➕ emoji 彩色位图
     let pad = 6;
     let img_rc = RECT { left: add_rc.left + pad, top: add_rc.top + pad, right: add_rc.right - pad, bottom: add_rc.bottom - pad };
-    gdi::blit_bgra(hdc, img_rc, crate::emoji::PLUS_EMOJI, crate::emoji::PLUS_EMOJI_W, crate::emoji::PLUS_EMOJI_H);
+    gdi::blit_bgra(mem, img_rc, crate::emoji::PLUS_EMOJI, crate::emoji::PLUS_EMOJI_W, crate::emoji::PLUS_EMOJI_H);
 
     // 输入框
     if s.input_visible {
         let in_y = TITLE_H + HEADER_H;
         let in_rc = RECT { left: 20, top: in_y + 5, right: WIN_W - 20, bottom: in_y + INPUT_H - 5 };
-        gdi::round_rect(hdc, in_rc, 10, rgb(C_CARD.0, C_CARD.1, C_CARD.2), rgb(C_PURPLE.0, C_PURPLE.1, C_PURPLE.2), 1);
+        gdi::round_rect(mem, in_rc, 10, rgb(C_CARD.0, C_CARD.1, C_CARD.2), rgb(C_PURPLE.0, C_PURPLE.1, C_PURPLE.2), 1);
         let text = if s.input_buffer.is_empty() { "输入新任务..." } else { &s.input_buffer };
         let color = if s.input_buffer.is_empty() { rgb(150, 150, 150) } else { rgb(C_TEXT.0, C_TEXT.1, C_TEXT.2) };
         let txt_rc = RECT { left: 20 + 12, top: in_y + 5, right: WIN_W - 20 - 12, bottom: in_y + INPUT_H - 5 };
-        gdi::draw_text(hdc, text, txt_rc, color, DT_LEFT | DT_VCENTER | DT_SINGLELINE, s.font_item);
+        gdi::draw_text(mem, text, txt_rc, color, DT_LEFT | DT_VCENTER | DT_SINGLELINE, s.font_item);
     }
 
     // 任务列表（裁剪到列表区，支持滚轮滚动）
@@ -306,16 +409,22 @@ unsafe fn paint(hwnd: HWND) {
     let tasks = s.store.lock().unwrap().all().to_vec();
     let maxs = scroll_max(tasks.len(), top);
     if s.scroll_y > maxs { s.scroll_y = maxs; }
-    let saved = SaveDC(hdc);
-    IntersectClipRect(hdc, 0, top, WIN_W, WIN_H);
+    let saved = SaveDC(mem);
+    IntersectClipRect(mem, 0, top, WIN_W, WIN_H);
     let mut y = top - s.scroll_y;
     for task in &tasks {
-        draw_card(hdc, s, task, y);
+        draw_card(mem, s, task, y);
         y += CARD_H + CARD_GAP;
     }
-    RestoreDC(hdc, saved);
+    RestoreDC(mem, saved);
+
+    BitBlt(hdc, 0, 0, WIN_W, WIN_H, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old_bmp);
+    DeleteObject(bmp);
+    DeleteDC(mem);
 
     EndPaint(hwnd, &ps);
+    let _ = ShowCaret(hwnd);
 }
 
 unsafe fn draw_card(hdc: HDC, s: &TaskWinState, task: &crate::store::Task, y: i32) {
