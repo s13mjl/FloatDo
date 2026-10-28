@@ -19,6 +19,8 @@ const INPUT_H: i32 = 50;
 const CARD_H: i32 = 60;
 const CARD_GAP: i32 = 8;
 const MARGIN_X: i32 = 15;
+const CORNER_R: i32 = 16;
+const TIMER_CARET: usize = 1;
 
 const C_PURPLE: (u8, u8, u8) = (108, 92, 231);
 const C_WHITE: (u8, u8, u8) = (255, 255, 255);
@@ -43,6 +45,7 @@ pub struct TaskWinState {
     pub font_item_done: HFONT,
     pub font_btn: HFONT,
     pub scroll_y: i32,
+    pub caret_on: bool,
 }
 
 static mut TASKWIN: *mut TaskWinState = std::ptr::null_mut();
@@ -63,7 +66,7 @@ pub fn create(store: Arc<Mutex<TaskStore>>) {
         RegisterClassExW(&wc);
 
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             class,
             w!("待办事项"),
             WS_POPUP,
@@ -79,9 +82,6 @@ pub fn create(store: Arc<Mutex<TaskStore>>) {
         let font_item_done = gdi::make_font(-15, false, true);
         let font_btn = gdi::make_font(-18, true, false);
 
-        let rgn = CreateRoundRectRgn(0, 0, WIN_W + 1, WIN_H + 1, 16, 16);
-        SetWindowRgn(hwnd, rgn, TRUE);
-
         let st = Box::leak(Box::new(TaskWinState {
             hwnd,
             store,
@@ -95,6 +95,7 @@ pub fn create(store: Arc<Mutex<TaskStore>>) {
             font_item_done,
             font_btn,
             scroll_y: 0,
+            caret_on: false,
         }));
         TASKWIN = st;
     }
@@ -103,11 +104,14 @@ pub fn create(store: Arc<Mutex<TaskStore>>) {
 pub fn show_current() {
     unsafe {
         if !TASKWIN.is_null() {
-            let st = &*TASKWIN;
+            let st = &mut *TASKWIN;
             ShowWindow(st.hwnd, SW_SHOW);
             SetForegroundWindow(st.hwnd);
             SetFocus(st.hwnd);
-            update_caret(st.hwnd, st);
+            reset_caret(st.hwnd, st);
+            InvalidateRect(st.hwnd, None, false);
+            // 同步画出首帧，避免分层窗口在 UpdateLayeredWindow 之前呈现为透明
+            let _ = UpdateWindow(st.hwnd);
         }
     }
 }
@@ -115,8 +119,10 @@ pub fn show_current() {
 pub fn hide_current() {
     unsafe {
         if !TASKWIN.is_null() {
-            let _ = DestroyCaret();
-            ShowWindow((*TASKWIN).hwnd, SW_HIDE);
+            let st = &mut *TASKWIN;
+            let _ = KillTimer(st.hwnd, TIMER_CARET);
+            st.caret_on = false;
+            ShowWindow(st.hwnd, SW_HIDE);
         }
     }
 }
@@ -149,31 +155,29 @@ fn over_card_action(s: &TaskWinState, x: i32, y: i32) -> bool {
     false
 }
 
-/// 在输入框文本末尾显示/更新系统插入光标（闪烁由系统驱动）。
-unsafe fn update_caret(hwnd: HWND, s: &TaskWinState) {
-    if !s.input_visible || GetFocus() != hwnd {
-        let _ = DestroyCaret();
+/// 输入框是否处于「可显示插入光标」状态（打开且窗口持有焦点）。
+unsafe fn caret_active(hwnd: HWND, s: &TaskWinState) -> bool {
+    s.input_visible && GetFocus() == hwnd
+}
+
+/// 让插入光标立即可见并重启闪烁计时（打字时保持常亮）。
+unsafe fn reset_caret(hwnd: HWND, s: &mut TaskWinState) {
+    if !caret_active(hwnd, s) {
+        stop_caret(hwnd, s);
         return;
     }
-    let hdc = GetDC(hwnd);
-    let old = SelectObject(hdc, s.font_item);
-    let mut sz = SIZE::default();
-    let wide: Vec<u16> = s.input_buffer.encode_utf16().collect();
-    if !wide.is_empty() {
-        GetTextExtentPoint32W(hdc, &wide, &mut sz);
+    s.caret_on = true;
+    SetTimer(hwnd, TIMER_CARET, 530, None);
+    invalidate_input(hwnd);
+}
+
+/// 停止闪烁并隐藏插入光标。
+unsafe fn stop_caret(hwnd: HWND, s: &mut TaskWinState) {
+    let _ = KillTimer(hwnd, TIMER_CARET);
+    if s.caret_on {
+        s.caret_on = false;
+        invalidate_input(hwnd);
     }
-    SelectObject(hdc, old);
-    ReleaseDC(hwnd, hdc);
-
-    let h = if sz.cy > 0 { sz.cy } else { 20 };
-    let left = 20 + 12;
-    let right = WIN_W - 20 - 12;
-    let x = (left + sz.cx).clamp(left, right - 1);
-    let y = TITLE_H + HEADER_H + (INPUT_H - h) / 2;
-
-    let _ = CreateCaret(hwnd, HBITMAP(std::ptr::null_mut()), 1, h);
-    let _ = SetCaretPos(x, y);
-    let _ = ShowCaret(hwnd);
 }
 
 unsafe extern "system" fn task_wndproc(
@@ -190,16 +194,27 @@ unsafe extern "system" fn task_wndproc(
             paint(hwnd);
             LRESULT(0)
         }
+        // 分层窗口只有 UpdateLayeredWindow 过才有内容，显示时必须整窗重绘一次
+        WM_SHOWWINDOW => {
+            if wparam.0 != 0 {
+                InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
         WM_SETFOCUS => {
-            update_caret(hwnd, st());
+            reset_caret(hwnd, st());
             LRESULT(0)
         }
         WM_KILLFOCUS => {
-            let _ = DestroyCaret();
+            stop_caret(hwnd, st());
             LRESULT(0)
         }
-        WM_MOVE => {
-            update_caret(hwnd, st());
+        WM_TIMER => {
+            if wparam.0 == TIMER_CARET {
+                let s = st();
+                s.caret_on = !s.caret_on;
+                invalidate_input(hwnd);
+            }
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -223,12 +238,12 @@ unsafe extern "system" fn task_wndproc(
                 s.input_visible = !s.input_visible;
                 if s.input_visible { s.input_buffer.clear(); }
                 InvalidateRect(hwnd, None, false);
-                update_caret(hwnd, s);
+                reset_caret(hwnd, s);
                 return LRESULT(0);
             }
             if s.input_visible && p.y >= TITLE_H + HEADER_H && p.y < TITLE_H + HEADER_H + INPUT_H {
                 SetFocus(hwnd);
-                update_caret(hwnd, s);
+                reset_caret(hwnd, s);
                 return LRESULT(0);
             }
             let top = list_top(s) - s.scroll_y;
@@ -315,25 +330,25 @@ unsafe extern "system" fn task_wndproc(
                         s.input_buffer.clear();
                         s.input_visible = false;
                         InvalidateRect(hwnd, None, false);
-                        update_caret(hwnd, s);
+                        reset_caret(hwnd, s);
                     }
                     8 => {
                         s.input_buffer.pop();
                         invalidate_input(hwnd);
-                        update_caret(hwnd, s);
+                        reset_caret(hwnd, s);
                     }
                     27 => {
                         s.input_buffer.clear();
                         s.input_visible = false;
                         InvalidateRect(hwnd, None, false);
-                        update_caret(hwnd, s);
+                        reset_caret(hwnd, s);
                     }
                     _ => {
                         if let Some(ch) = char::from_u32(c) {
                             if !ch.is_control() {
                                 s.input_buffer.push(ch);
                                 invalidate_input(hwnd);
-                                update_caret(hwnd, s);
+                                reset_caret(hwnd, s);
                             }
                         }
                     }
@@ -358,15 +373,52 @@ unsafe fn invalidate_input(hwnd: HWND) {
     InvalidateRect(hwnd, Some(&rc), false);
 }
 
+/// 圆角抗锯齿：内部像素 alpha=255；四个角落按圆弧覆盖率渐变写 alpha（RGB 同步预乘）。
+unsafe fn round_corner_alpha(px: *mut u32, w: i32, h: i32, r: i32) {
+    let rf = r as f32;
+    for y in 0..h {
+        for x in 0..w {
+            let p = px.offset((y * w + x) as isize);
+            let in_corner = (x < r || x >= w - r) && (y < r || y >= h - r);
+            if !in_corner {
+                *p |= 0xFF00_0000;
+                continue;
+            }
+            let ccx = if x < r { rf } else { (w - r) as f32 };
+            let ccy = if y < r { rf } else { (h - r) as f32 };
+            let dx = x as f32 + 0.5 - ccx;
+            let dy = y as f32 + 0.5 - ccy;
+            let d = (dx * dx + dy * dy).sqrt();
+            let cov = (rf + 0.5 - d).clamp(0.0, 1.0);
+            let v = *p;
+            let bp = ((v & 0xFF) as f32 * cov) as u32;
+            let gp = (((v >> 8) & 0xFF) as f32 * cov) as u32;
+            let rp = (((v >> 16) & 0xFF) as f32 * cov) as u32;
+            let ap = (cov * 255.0) as u32;
+            *p = (ap << 24) | (rp << 16) | (gp << 8) | bp;
+        }
+    }
+}
+
 unsafe fn paint(hwnd: HWND) {
     let s = st();
     let mut ps = PAINTSTRUCT::default();
-    let hdc = BeginPaint(hwnd, &mut ps);
-    let _ = HideCaret(hwnd);
+    let _ = BeginPaint(hwnd, &mut ps);
 
-    // 双缓冲：先画入内存位图，最后一次性拷贝上屏，避免逐项绘制时闪烁
-    let mem = CreateCompatibleDC(hdc);
-    let bmp = CreateCompatibleBitmap(hdc, WIN_W, WIN_H);
+    // 画入 32 位 DIB，再用 UpdateLayeredWindow 逐像素上屏，
+    // 圆角由 alpha 渐变实现抗锯齿（窗口区域裁剪是二值的，做不到平滑边缘）
+    let screen = GetDC(None);
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = WIN_W;
+    bmi.bmiHeader.biHeight = -WIN_H; // 自上而下
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB.0 as u32;
+
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let bmp = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+    let mem = CreateCompatibleDC(screen);
     let old_bmp = SelectObject(mem, bmp);
 
     let full = RECT { left: 0, top: 0, right: WIN_W, bottom: WIN_H };
@@ -397,11 +449,31 @@ unsafe fn paint(hwnd: HWND) {
     if s.input_visible {
         let in_y = TITLE_H + HEADER_H;
         let in_rc = RECT { left: 20, top: in_y + 5, right: WIN_W - 20, bottom: in_y + INPUT_H - 5 };
-        gdi::round_rect(mem, in_rc, 10, rgb(C_CARD.0, C_CARD.1, C_CARD.2), rgb(C_PURPLE.0, C_PURPLE.1, C_PURPLE.2), 1);
+        gdi::round_rect_aa(bits as *mut u32, WIN_W, full, in_rc, 10.0,
+            rgb(C_CARD.0, C_CARD.1, C_CARD.2), rgb(C_PURPLE.0, C_PURPLE.1, C_PURPLE.2), 1.0);
         let text = if s.input_buffer.is_empty() { "输入新任务..." } else { &s.input_buffer };
         let color = if s.input_buffer.is_empty() { rgb(150, 150, 150) } else { rgb(C_TEXT.0, C_TEXT.1, C_TEXT.2) };
         let txt_rc = RECT { left: 20 + 12, top: in_y + 5, right: WIN_W - 20 - 12, bottom: in_y + INPUT_H - 5 };
         gdi::draw_text(mem, text, txt_rc, color, DT_LEFT | DT_VCENTER | DT_SINGLELINE, s.font_item);
+
+        // 自绘插入光标（1px 竖线，闪烁节奏与系统一致）
+        if s.caret_on && caret_active(hwnd, s) {
+            let mut sz = SIZE::default();
+            let old_font = SelectObject(mem, s.font_item);
+            let wide: Vec<u16> = s.input_buffer.encode_utf16().collect();
+            if !wide.is_empty() {
+                GetTextExtentPoint32W(mem, &wide, &mut sz);
+            }
+            SelectObject(mem, old_font);
+            let ch = if sz.cy > 0 { sz.cy } else { 20 };
+            let left = 20 + 12;
+            let x = (left + sz.cx).clamp(left, WIN_W - 20 - 12 - 1);
+            let cy = TITLE_H + HEADER_H;
+            let caret_rc = RECT { left: x, top: cy + (INPUT_H - ch) / 2, right: x + 1, bottom: cy + (INPUT_H - ch) / 2 + ch };
+            let brush = CreateSolidBrush(rgb(C_TEXT.0, C_TEXT.1, C_TEXT.2));
+            FillRect(mem, &caret_rc, brush);
+            DeleteObject(brush);
+        }
     }
 
     // 任务列表（裁剪到列表区，支持滚轮滚动）
@@ -411,40 +483,67 @@ unsafe fn paint(hwnd: HWND) {
     if s.scroll_y > maxs { s.scroll_y = maxs; }
     let saved = SaveDC(mem);
     IntersectClipRect(mem, 0, top, WIN_W, WIN_H);
+    let clip = RECT { left: 0, top, right: WIN_W, bottom: WIN_H };
     let mut y = top - s.scroll_y;
     for task in &tasks {
-        draw_card(mem, s, task, y);
+        draw_card(mem, bits as *mut u32, clip, s, task, y);
         y += CARD_H + CARD_GAP;
     }
     RestoreDC(mem, saved);
 
-    BitBlt(hdc, 0, 0, WIN_W, WIN_H, mem, 0, 0, SRCCOPY);
+    round_corner_alpha(bits as *mut u32, WIN_W, WIN_H, CORNER_R);
+
+    let mut rc = RECT::default();
+    let _ = GetWindowRect(hwnd, &mut rc);
+    let pt_dst = POINT { x: rc.left, y: rc.top };
+    let pt_src = POINT { x: 0, y: 0 };
+    let sz = SIZE { cx: WIN_W, cy: WIN_H };
+    let blend = BLENDFUNCTION {
+        BlendOp: 0,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: 1,
+    };
+    let _ = UpdateLayeredWindow(
+        hwnd,
+        None,
+        Some(&pt_dst),
+        Some(&sz),
+        mem,
+        Some(&pt_src),
+        COLORREF(0),
+        Some(&blend),
+        ULW_ALPHA,
+    );
+
     SelectObject(mem, old_bmp);
     DeleteObject(bmp);
     DeleteDC(mem);
+    ReleaseDC(None, screen);
 
     EndPaint(hwnd, &ps);
-    let _ = ShowCaret(hwnd);
 }
 
-unsafe fn draw_card(hdc: HDC, s: &TaskWinState, task: &crate::store::Task, y: i32) {
+unsafe fn draw_card(
+    hdc: HDC,
+    px: *mut u32,
+    clip: RECT,
+    s: &TaskWinState,
+    task: &crate::store::Task,
+    y: i32,
+) {
     let bg = if task.completed { C_CARD_DONE } else { C_CARD };
     let card = RECT { left: MARGIN_X, top: y, right: WIN_W - MARGIN_X, bottom: y + CARD_H };
-    gdi::round_rect(hdc, card, 12, rgb(bg.0, bg.1, bg.2), rgb(C_BORDER.0, C_BORDER.1, C_BORDER.2), 1);
+    gdi::round_rect_aa(px, WIN_W, clip, card, 12.0,
+        rgb(bg.0, bg.1, bg.2), rgb(C_BORDER.0, C_BORDER.1, C_BORDER.2), 1.0);
 
     let cx = MARGIN_X + 15 + 11;
     let cy = y + CARD_H / 2;
     let chk = RECT { left: cx - 9, top: cy - 9, right: cx + 9, bottom: cy + 9 };
     if task.completed {
-        gdi::fill_ellipse(hdc, chk, rgb(C_PURPLE.0, C_PURPLE.1, C_PURPLE.2));
+        gdi::fill_ellipse_aa(px, WIN_W, clip, chk, rgb(C_PURPLE.0, C_PURPLE.1, C_PURPLE.2));
     } else {
-        let pen = CreatePen(PS_SOLID, 2, rgb(C_CHK_BORDER.0, C_CHK_BORDER.1, C_CHK_BORDER.2));
-        let op = SelectObject(hdc, pen);
-        let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        Ellipse(hdc, chk.left, chk.top, chk.right, chk.bottom);
-        SelectObject(hdc, ob);
-        SelectObject(hdc, op);
-        DeleteObject(pen);
+        gdi::stroke_ellipse_aa(px, WIN_W, clip, chk, 2.0, rgb(C_CHK_BORDER.0, C_CHK_BORDER.1, C_CHK_BORDER.2));
     }
 
     let text_color = if task.completed { C_MUTED } else { C_TEXT };

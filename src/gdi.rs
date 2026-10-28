@@ -44,35 +44,200 @@ pub unsafe fn draw_text(
     SelectObject(hdc, old);
 }
 
-/// 填充 + 描边的圆角矩形。
-pub unsafe fn round_rect(
-    hdc: HDC,
+/// 填充 + 描边的抗锯齿圆角矩形（逐像素写入 DIB，clip 为裁剪区域）。
+pub unsafe fn round_rect_aa(
+    px: *mut u32,
+    stride: i32,
+    clip: RECT,
     rect: RECT,
-    radius: i32,
+    radius: f32,
     fill: COLORREF,
-    border_color: COLORREF,
-    border_width: i32,
+    border: COLORREF,
+    border_w: f32,
 ) {
-    let brush = CreateSolidBrush(fill);
-    let pen = CreatePen(PS_SOLID, border_width, border_color);
-    let ob = SelectObject(hdc, brush);
-    let op = SelectObject(hdc, pen);
-    RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
-    SelectObject(hdc, op);
-    SelectObject(hdc, ob);
-    DeleteObject(pen);
-    DeleteObject(brush);
+    let x0 = rect.left.max(clip.left).max(0);
+    let y0 = rect.top.max(clip.top).max(0);
+    let x1 = rect.right.min(clip.right);
+    let y1 = rect.bottom.min(clip.bottom);
+    let cx = (rect.left + rect.right) as f32 * 0.5;
+    let cy = (rect.top + rect.bottom) as f32 * 0.5;
+    let hw = ((rect.right - rect.left) as f32 * 0.5 - radius).max(0.0);
+    let hh = ((rect.bottom - rect.top) as f32 * 0.5 - radius).max(0.0);
+    let inner_r = (radius - border_w).max(0.0);
+    let (br, bg, bb) = unpack(border);
+    let (fr, fg, fb) = unpack(fill);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+            let idx = (y * stride + x) as usize;
+            let cov_out = edge_cov(sdf_round_rect(fx, fy, cx, cy, hw, hh, radius),
+                || sub_cov_round_rect(x as f32, y as f32, cx, cy, hw, hh, radius));
+            if cov_out > 0.0 {
+                blend_px(px, idx, br, bg, bb, cov_out);
+            }
+            let cov_in = edge_cov(sdf_round_rect(fx, fy, cx, cy, hw, hh, inner_r),
+                || sub_cov_round_rect(x as f32, y as f32, cx, cy, hw, hh, inner_r));
+            if cov_in > 0.0 {
+                blend_px(px, idx, fr, fg, fb, cov_in);
+            }
+        }
+    }
 }
 
-/// 填充椭圆（无描边）。
-pub unsafe fn fill_ellipse(hdc: HDC, rect: RECT, color: COLORREF) {
-    let brush = CreateSolidBrush(color);
-    let ob = SelectObject(hdc, brush);
-    let op = SelectObject(hdc, GetStockObject(NULL_PEN));
-    Ellipse(hdc, rect.left, rect.top, rect.right, rect.bottom);
-    SelectObject(hdc, op);
-    SelectObject(hdc, ob);
-    DeleteObject(brush);
+/// 抗锯齿填充椭圆。
+pub unsafe fn fill_ellipse_aa(px: *mut u32, stride: i32, clip: RECT, rect: RECT, color: COLORREF) {
+    let x0 = rect.left.max(clip.left).max(0);
+    let y0 = rect.top.max(clip.top).max(0);
+    let x1 = rect.right.min(clip.right);
+    let y1 = rect.bottom.min(clip.bottom);
+    let cx = (rect.left + rect.right) as f32 * 0.5;
+    let cy = (rect.top + rect.bottom) as f32 * 0.5;
+    let rx = (rect.right - rect.left) as f32 * 0.5;
+    let ry = (rect.bottom - rect.top) as f32 * 0.5;
+    let (r, g, b) = unpack(color);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+            let cov = edge_cov(sdf_ellipse(fx, fy, cx, cy, rx, ry),
+                || sub_cov_ellipse(x as f32, y as f32, cx, cy, rx, ry));
+            if cov > 0.0 {
+                blend_px(px, (y * stride + x) as usize, r, g, b, cov);
+            }
+        }
+    }
+}
+
+/// 抗锯齿椭圆描边。
+pub unsafe fn stroke_ellipse_aa(
+    px: *mut u32,
+    stride: i32,
+    clip: RECT,
+    rect: RECT,
+    width: f32,
+    color: COLORREF,
+) {
+    // 椭圆矩形即描边外缘：路径半径向内收一半笔宽，与 GDI 画笔的绘制范围一致
+    let half = width * 0.5;
+    let x0 = rect.left.max(clip.left).max(0);
+    let y0 = rect.top.max(clip.top).max(0);
+    let x1 = rect.right.min(clip.right);
+    let y1 = rect.bottom.min(clip.bottom);
+    let cx = (rect.left + rect.right) as f32 * 0.5;
+    let cy = (rect.top + rect.bottom) as f32 * 0.5;
+    let prx = ((rect.right - rect.left) as f32 * 0.5 - half).max(1.0);
+    let pry = ((rect.bottom - rect.top) as f32 * 0.5 - half).max(1.0);
+    let (r, g, b) = unpack(color);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+            let cov = edge_cov(sdf_ellipse(fx, fy, cx, cy, prx, pry).abs() - half,
+                || sub_cov_ring(x as f32, y as f32, cx, cy, prx, pry, half));
+            if cov > 0.0 {
+                blend_px(px, (y * stride + x) as usize, r, g, b, cov);
+            }
+        }
+    }
+}
+
+/// 像素中心离形状边缘超过 0.8px 时可直接判定 0/1，只有边界像素做超采样。
+#[inline]
+fn edge_cov(sd: f32, sample: impl FnOnce() -> f32) -> f32 {
+    if sd <= -0.8 {
+        1.0
+    } else if sd >= 0.8 {
+        0.0
+    } else {
+        sample()
+    }
+}
+
+const AA_N: i32 = 8;
+
+/// 8x8 超采样：圆角矩形精确包含判定。
+fn sub_cov_round_rect(x: f32, y: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -> f32 {
+    let step = 1.0 / AA_N as f32;
+    let mut hit = 0;
+    for sy in 0..AA_N {
+        let py = y + (sy as f32 + 0.5) * step;
+        for sx in 0..AA_N {
+            let px = x + (sx as f32 + 0.5) * step;
+            let ax = ((px - cx).abs() - hw).max(0.0);
+            let ay = ((py - cy).abs() - hh).max(0.0);
+            if ax * ax + ay * ay <= r * r {
+                hit += 1;
+            }
+        }
+    }
+    hit as f32 / (AA_N * AA_N) as f32
+}
+
+/// 8x8 超采样：椭圆包含判定。
+fn sub_cov_ellipse(x: f32, y: f32, cx: f32, cy: f32, rx: f32, ry: f32) -> f32 {
+    let step = 1.0 / AA_N as f32;
+    let mut hit = 0;
+    for sy in 0..AA_N {
+        let ny = (y + (sy as f32 + 0.5) * step - cy) / ry;
+        for sx in 0..AA_N {
+            let nx = (x + (sx as f32 + 0.5) * step - cx) / rx;
+            if nx * nx + ny * ny <= 1.0 {
+                hit += 1;
+            }
+        }
+    }
+    hit as f32 / (AA_N * AA_N) as f32
+}
+
+/// 8x8 超采样：椭圆环带判定（|到椭圆距离| <= half）。
+fn sub_cov_ring(x: f32, y: f32, cx: f32, cy: f32, rx: f32, ry: f32, half: f32) -> f32 {
+    let step = 1.0 / AA_N as f32;
+    let mut hit = 0;
+    for sy in 0..AA_N {
+        let py = y + (sy as f32 + 0.5) * step;
+        for sx in 0..AA_N {
+            let px = x + (sx as f32 + 0.5) * step;
+            if sdf_ellipse(px, py, cx, cy, rx, ry).abs() <= half {
+                hit += 1;
+            }
+        }
+    }
+    hit as f32 / (AA_N * AA_N) as f32
+}
+
+#[inline]
+fn unpack(c: COLORREF) -> (u32, u32, u32) {
+    (c.0 & 0xFF, (c.0 >> 8) & 0xFF, (c.0 >> 16) & 0xFF)
+}
+
+#[inline]
+fn sdf_round_rect(x: f32, y: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -> f32 {
+    let qx = (x - cx).abs() - hw;
+    let qy = (y - cy).abs() - hh;
+    let ax = qx.max(0.0);
+    let ay = qy.max(0.0);
+    (ax * ax + ay * ay).sqrt() + qx.max(qy).min(0.0) - r
+}
+
+#[inline]
+fn sdf_ellipse(x: f32, y: f32, cx: f32, cy: f32, rx: f32, ry: f32) -> f32 {
+    let nx = (x - cx) / rx;
+    let ny = (y - cy) / ry;
+    ((nx * nx + ny * ny).sqrt() - 1.0) * rx.min(ry)
+}
+
+/// 以覆盖率把颜色混入 DIB 像素（内存序 B G R A，保留 alpha 字节）。
+#[inline]
+unsafe fn blend_px(px: *mut u32, idx: usize, r: u32, g: u32, b: u32, cov: f32) {
+    let v = *px.add(idx);
+    let db = (v & 0xFF) as f32;
+    let dg = ((v >> 8) & 0xFF) as f32;
+    let dr = ((v >> 16) & 0xFF) as f32;
+    let nb = (db + (b as f32 - db) * cov + 0.5).min(255.0) as u32;
+    let ng = (dg + (g as f32 - dg) * cov + 0.5).min(255.0) as u32;
+    let nr = (dr + (r as f32 - dr) * cov + 0.5).min(255.0) as u32;
+    *px.add(idx) = (v & 0xFF00_0000) | (nr << 16) | (ng << 8) | nb;
 }
 
 /// 将 BGRA 像素图（含 alpha）绘制到目标 DC（用于彩色 emoji）。
@@ -111,6 +276,7 @@ pub unsafe fn blit_bgra(hdc: HDC, dst: RECT, px: &[u8], w: i32, h: i32) {
 }
 
 /// 渲染悬浮球像素（预乘 BGRA）。breath ∈ [0,1] 光晕脉动，anim_scale 缩放动画。
+/// 边缘按 1px 覆盖率抗锯齿，避免圆形轮廓出现台阶。
 pub fn render_ball(size: i32, breath: f32, anim_scale: f32) -> Vec<u32> {
     let mut px = vec![0u32; (size * size) as usize];
     let cx = size as f32 / 2.0;
@@ -125,49 +291,44 @@ pub fn render_ball(size: i32, breath: f32, anim_scale: f32) -> Vec<u32> {
             let dy = y as f32 + 0.5 - cy;
             let d = (dx * dx + dy * dy).sqrt();
 
-            let mut a = 0.0f32;
-            let mut r = 0.0f32;
-            let mut g = 0.0f32;
-            let mut b = 0.0f32;
+            // 半径 r 的圆在该像素上的覆盖度（0..1，边缘 1px 渐变）
+            let cov = |r: f32| (r + 0.5 - d).clamp(0.0, 1.0);
 
             // 光晕层（紫 → 青渐变）
-            if d <= glow_r {
-                let t = (d / glow_r).clamp(0.0, 1.0);
-                let ga = (1.0 - t).powf(1.6) * 0.55;
-                r = 108.0 - 108.0 * t;
-                g = 92.0 + 76.0 * t;
-                b = 231.0 + 24.0 * t;
-                a = ga;
-            }
+            let t = (d / glow_r).clamp(0.0, 1.0);
+            let ga = (1.0 - t).powf(1.6) * 0.55 * cov(glow_r);
+            let gr = 108.0 - 108.0 * t;
+            let gg = 92.0 + 76.0 * t;
+            let gb = 231.0 + 24.0 * t;
 
             // 球体层
-            if d <= base_r {
-                let t = (d / base_r).clamp(0.0, 1.0);
-                let sr = 40.0 + 90.0 * (1.0 - t);
-                let sg = 40.0 + 70.0 * (1.0 - t);
-                let sb = 70.0 + 180.0 * (1.0 - t);
-                a = 1.0 - 0.15 * t;
-                r = sr;
-                g = sg;
-                b = sb;
-                // 左上高光
+            let bcov = cov(base_r);
+            let mut ba = 0.0f32;
+            let (mut br, mut bg, mut bb) = (0.0f32, 0.0f32, 0.0f32);
+            if bcov > 0.0 {
+                let tb = (d / base_r).clamp(0.0, 1.0);
+                br = 40.0 + 90.0 * (1.0 - tb);
+                bg = 40.0 + 70.0 * (1.0 - tb);
+                bb = 70.0 + 180.0 * (1.0 - tb);
+                ba = (1.0 - 0.15 * tb) * bcov;
+
+                // 左上高光（径向已平滑衰减至 0，无需再做边缘覆盖）
                 let hx = cx - base_r * 0.35;
                 let hy = cy - base_r * 0.45;
                 let hd = ((x as f32 - hx).powi(2) + (y as f32 - hy).powi(2)).sqrt();
                 let hr = base_r * 0.45;
-                if hd <= hr {
-                    let ht = (hd / hr).clamp(0.0, 1.0);
-                    let ha = (1.0 - ht) * 0.5;
-                    r = (r + 255.0 * ha).min(255.0);
-                    g = (g + 255.0 * ha).min(255.0);
-                    b = (b + 255.0 * ha).min(255.0);
-                }
+                let ht = (hd / hr).clamp(0.0, 1.0);
+                let ha = (1.0 - ht) * 0.5;
+                br = (br + 255.0 * ha).min(255.0);
+                bg = (bg + 255.0 * ha).min(255.0);
+                bb = (bb + 255.0 * ha).min(255.0);
             }
 
-            let ai = (a.clamp(0.0, 1.0) * 255.0) as u32;
-            let ri = ((r * a).clamp(0.0, 255.0)) as u32;
-            let gi = ((g * a).clamp(0.0, 255.0)) as u32;
-            let bi = ((b * a).clamp(0.0, 255.0)) as u32;
+            // 球体 over 光晕，按预乘 alpha 存储
+            let ai = ((ba + ga * (1.0 - ba)).clamp(0.0, 1.0) * 255.0) as u32;
+            let ri = ((br * ba + gr * ga * (1.0 - ba)).clamp(0.0, 255.0)) as u32;
+            let gi = ((bg * ba + gg * ga * (1.0 - ba)).clamp(0.0, 255.0)) as u32;
+            let bi = ((bb * ba + gb * ga * (1.0 - ba)).clamp(0.0, 255.0)) as u32;
             px[(y * size + x) as usize] = (ai << 24) | (ri << 16) | (gi << 8) | bi;
         }
     }
@@ -332,3 +493,4 @@ pub unsafe fn make_tray_icon() -> HICON {
 
     icon
 }
+
