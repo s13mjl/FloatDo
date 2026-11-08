@@ -1,6 +1,6 @@
 [package]
 name = "floatdo_native"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "FloatDo 纯 Win32 原生版 —— 内存占用极小的悬浮球待办工具"
 
