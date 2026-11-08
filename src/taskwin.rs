@@ -1,12 +1,15 @@
 //! 任务窗口 —— 纯 Win32 自绘（无 Edit/ListBox 控件，内存占用最低）。
 
 use crate::gdi::{self, rgb};
-use crate::store::TaskStore;
+use crate::store::{short_date, TaskStore, today};
+use chrono::{Datelike, Local, NaiveDate};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, SetCapture, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
@@ -22,6 +25,29 @@ const MARGIN_X: i32 = 15;
 const CORNER_R: i32 = 16;
 const TIMER_CARET: usize = 1;
 
+// 输入框内的日期胶囊
+const DATE_CHIP_W: i32 = 84;
+const DATE_CHIP_H: i32 = 26;
+
+// 日期选择弹层（全自绘）
+const CAL_W: i32 = 262;
+const CAL_PAD: i32 = 12;
+const CAL_HDR_Y: i32 = 10;
+const CAL_HDR_H: i32 = 34;
+const CAL_WEEK_H: i32 = 24;
+const CAL_CELL: i32 = 34;
+const CAL_ROWS: i32 = 6;
+const CAL_GRID_Y: i32 = CAL_HDR_Y + CAL_HDR_H + CAL_WEEK_H;
+const CAL_GRID_H: i32 = CAL_CELL * CAL_ROWS;
+const CAL_FOOT_Y: i32 = CAL_GRID_Y + CAL_GRID_H + 6;
+const CAL_FOOT_H: i32 = 30;
+const CAL_H: i32 = CAL_FOOT_Y + CAL_FOOT_H + 10;
+const CAL_HIT_NONE: i32 = -1;
+const CAL_HIT_PREV: i32 = 100;
+const CAL_HIT_NEXT: i32 = 101;
+const CAL_HIT_TODAY: i32 = 102;
+const CAL_HIT_CLEAR: i32 = 103;
+
 const C_PURPLE: (u8, u8, u8) = (108, 92, 231);
 const C_WHITE: (u8, u8, u8) = (255, 255, 255);
 const C_BORDER: (u8, u8, u8) = (222, 226, 230);
@@ -31,12 +57,16 @@ const C_CARD: (u8, u8, u8) = (248, 249, 250);
 const C_CARD_DONE: (u8, u8, u8) = (233, 236, 239);
 const C_CHK_BORDER: (u8, u8, u8) = (178, 190, 195);
 const C_DEL: (u8, u8, u8) = (178, 190, 195);
+const C_HOVER: (u8, u8, u8) = (238, 237, 250);
+const C_WEEKEND: (u8, u8, u8) = (168, 176, 180);
 
 pub struct TaskWinState {
     pub hwnd: HWND,
     pub store: Arc<Mutex<TaskStore>>,
     pub input_visible: bool,
     pub input_buffer: String,
+    /// 新建任务时选择的日期（YYYY-MM-DD），None 表示不设定日期。
+    pub input_date: Option<String>,
     pub drag_off: POINT,
     pub dragging: bool,
     pub font_title: HFONT,
@@ -44,11 +74,25 @@ pub struct TaskWinState {
     pub font_item: HFONT,
     pub font_item_done: HFONT,
     pub font_btn: HFONT,
+    pub font_date: HFONT,
     pub scroll_y: i32,
     pub caret_on: bool,
 }
 
+/// 日期选择弹层状态。
+struct CalState {
+    hwnd: HWND,
+    view_year: i32,
+    view_month: u32,
+    hover: i32,
+    font_hdr: HFONT,
+    font_day: HFONT,
+    font_week: HFONT,
+}
+
 static mut TASKWIN: *mut TaskWinState = std::ptr::null_mut();
+static mut CAL: *mut CalState = std::ptr::null_mut();
+static mut CAL_HIDE_AT: Option<std::time::Instant> = None;
 
 pub fn create(store: Arc<Mutex<TaskStore>>) {
     let class = w!("FloatDoTaskClass");
@@ -81,12 +125,14 @@ pub fn create(store: Arc<Mutex<TaskStore>>) {
         let font_item = gdi::make_font(-15, false, false);
         let font_item_done = gdi::make_font(-15, false, true);
         let font_btn = gdi::make_font(-18, true, false);
+        let font_date = gdi::make_font(-13, false, false);
 
         let st = Box::leak(Box::new(TaskWinState {
             hwnd,
             store,
             input_visible: false,
             input_buffer: String::new(),
+            input_date: None,
             drag_off: POINT::default(),
             dragging: false,
             font_title,
@@ -94,10 +140,47 @@ pub fn create(store: Arc<Mutex<TaskStore>>) {
             font_item,
             font_item_done,
             font_btn,
+            font_date,
             scroll_y: 0,
             caret_on: false,
         }));
         TASKWIN = st;
+
+        // 日期选择弹层：预先创建，点日期胶囊时按需显示
+        let cal_class = w!("FloatDoCalClass");
+        let cal_wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(cal_wndproc),
+            hInstance: GetModuleHandleW(None).unwrap().into(),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap(),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
+            lpszClassName: cal_class,
+            ..Default::default()
+        };
+        RegisterClassExW(&cal_wc);
+
+        let cal_hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            cal_class,
+            w!("选择日期"),
+            WS_POPUP,
+            0, 0, CAL_W, CAL_H,
+            hwnd, None,
+            GetModuleHandleW(None).unwrap(),
+            None,
+        ).unwrap();
+
+        let now = Local::now();
+        CAL = Box::leak(Box::new(CalState {
+            hwnd: cal_hwnd,
+            view_year: now.year(),
+            view_month: now.month(),
+            hover: CAL_HIT_NONE,
+            font_hdr: gdi::make_font(-15, true, false),
+            font_day: gdi::make_font(-14, false, false),
+            font_week: gdi::make_font(-12, false, false),
+        }));
     }
 }
 
@@ -122,6 +205,7 @@ pub fn hide_current() {
             let st = &mut *TASKWIN;
             let _ = KillTimer(st.hwnd, TIMER_CARET);
             st.caret_on = false;
+            hide_calendar();
             ShowWindow(st.hwnd, SW_HIDE);
         }
     }
@@ -139,6 +223,189 @@ fn scroll_max(content_len: usize, view_top: i32) -> i32 {
     let content_h = content_len as i32 * (CARD_H + CARD_GAP);
     let view_h = WIN_H - view_top;
     (content_h - view_h).max(0)
+}
+
+/// 输入框右侧「日期」胶囊的矩形。
+fn chip_rect(s: &TaskWinState) -> RECT {
+    let in_y = TITLE_H + HEADER_H;
+    let cy = in_y + INPUT_H / 2;
+    RECT {
+        left: WIN_W - 20 - 8 - DATE_CHIP_W,
+        top: cy - DATE_CHIP_H / 2,
+        right: WIN_W - 20 - 8,
+        bottom: cy + DATE_CHIP_H / 2,
+    }
+}
+
+fn in_rect(rc: RECT, p: POINT) -> bool {
+    p.x >= rc.left && p.x < rc.right && p.y >= rc.top && p.y < rc.bottom
+}
+
+// ---------- 日期选择弹层（全自绘） ----------
+
+fn cal_prev_rect() -> RECT {
+    RECT {
+        left: CAL_PAD,
+        top: CAL_HDR_Y,
+        right: CAL_PAD + 28,
+        bottom: CAL_HDR_Y + CAL_HDR_H,
+    }
+}
+
+fn cal_next_rect() -> RECT {
+    RECT {
+        left: CAL_W - CAL_PAD - 28,
+        top: CAL_HDR_Y,
+        right: CAL_W - CAL_PAD,
+        bottom: CAL_HDR_Y + CAL_HDR_H,
+    }
+}
+
+fn cal_day_rect(idx: i32) -> RECT {
+    let col = idx % 7;
+    let row = idx / 7;
+    RECT {
+        left: CAL_PAD + col * CAL_CELL,
+        top: CAL_GRID_Y + row * CAL_CELL,
+        right: CAL_PAD + col * CAL_CELL + CAL_CELL,
+        bottom: CAL_GRID_Y + row * CAL_CELL + CAL_CELL,
+    }
+}
+
+fn cal_footer_rect(i: i32) -> RECT {
+    let w = (CAL_W - CAL_PAD * 2 - 8) / 2;
+    let left = CAL_PAD + i * (w + 8);
+    RECT {
+        left,
+        top: CAL_FOOT_Y,
+        right: left + w,
+        bottom: CAL_FOOT_Y + CAL_FOOT_H,
+    }
+}
+
+fn cal_first_weekday(year: i32, month: u32) -> i32 {
+    NaiveDate::from_ymd_opt(year, month, 1)
+        .map(|d| d.weekday().num_days_from_sunday() as i32)
+        .unwrap_or(0)
+}
+
+fn cal_days_in_month(year: i32, month: u32) -> i32 {
+    let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    match (
+        NaiveDate::from_ymd_opt(year, month, 1),
+        NaiveDate::from_ymd_opt(ny, nm, 1),
+    ) {
+        (Some(a), Some(b)) => (b - a).num_days() as i32,
+        _ => 30,
+    }
+}
+
+/// 网格位置对应的日期（不在本月的格子返回 None）。
+fn cal_day_at(cal: &CalState, idx: i32) -> Option<u32> {
+    let day = idx - cal_first_weekday(cal.view_year, cal.view_month) + 1;
+    if (1..=cal_days_in_month(cal.view_year, cal.view_month)).contains(&day) {
+        Some(day as u32)
+    } else {
+        None
+    }
+}
+
+fn cal_hit(cal: &CalState, p: POINT) -> i32 {
+    if in_rect(cal_prev_rect(), p) {
+        return CAL_HIT_PREV;
+    }
+    if in_rect(cal_next_rect(), p) {
+        return CAL_HIT_NEXT;
+    }
+    if in_rect(cal_footer_rect(0), p) {
+        return CAL_HIT_TODAY;
+    }
+    if in_rect(cal_footer_rect(1), p) {
+        return CAL_HIT_CLEAR;
+    }
+    for idx in 0..CAL_ROWS * 7 {
+        if cal_day_at(cal, idx).is_some() && in_rect(cal_day_rect(idx), p) {
+            return idx;
+        }
+    }
+    CAL_HIT_NONE
+}
+
+unsafe fn hide_calendar() {
+    if !CAL.is_null() {
+        ShowWindow((*CAL).hwnd, SW_HIDE);
+        CAL_HIDE_AT = Some(std::time::Instant::now());
+    }
+}
+
+unsafe fn toggle_calendar(main: HWND) {
+    if CAL.is_null() {
+        return;
+    }
+    if IsWindowVisible((*CAL).hwnd).as_bool() {
+        hide_calendar();
+        return;
+    }
+    // 弹层刚因点击别处而关闭时，不要被同一次点击立刻重新打开
+    if let Some(t) = CAL_HIDE_AT {
+        if t.elapsed() < std::time::Duration::from_millis(150) {
+            return;
+        }
+    }
+    show_calendar(main);
+}
+
+/// 在日期胶囊下方（空间不足时上方）弹出日历。
+unsafe fn show_calendar(main: HWND) {
+    let cal = &mut *CAL;
+    let s = st();
+    let base = s
+        .input_date
+        .as_deref()
+        .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+        .unwrap_or_else(|| Local::now().date_naive());
+    cal.view_year = base.year();
+    cal.view_month = base.month();
+    cal.hover = CAL_HIT_NONE;
+
+    let chip = chip_rect(s);
+    let mut below = POINT { x: chip.left, y: chip.bottom + 6 };
+    let mut above = POINT { x: chip.left, y: chip.top - 6 };
+    let _ = ClientToScreen(main, &mut below);
+    let _ = ClientToScreen(main, &mut above);
+
+    let mon = MonitorFromWindow(main, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO::default();
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    GetMonitorInfoW(mon, &mut mi);
+    let work = mi.rcWork;
+
+    let x = below.x.clamp(work.left, (work.right - CAL_W).max(work.left));
+    let y = if below.y + CAL_H <= work.bottom {
+        below.y
+    } else {
+        (above.y - CAL_H).max(work.top)
+    };
+
+    SetWindowPos(cal.hwnd, HWND_TOPMOST, x, y, CAL_W, CAL_H, SWP_NOACTIVATE);
+    ShowWindow(cal.hwnd, SW_SHOW);
+    SetForegroundWindow(cal.hwnd);
+    SetFocus(cal.hwnd);
+    InvalidateRect(cal.hwnd, None, false);
+    // 分层窗口必须先 UpdateLayeredWindow 才有内容，强制立即画首帧
+    let _ = UpdateWindow(cal.hwnd);
+}
+
+/// 选定日期（None 表示清除），关闭弹层并把焦点交回任务窗口。
+unsafe fn apply_date(date: Option<String>) {
+    let s = st();
+    s.input_date = date;
+    let main = s.hwnd;
+    hide_calendar();
+    InvalidateRect(main, None, false);
+    SetForegroundWindow(main);
+    SetFocus(main);
+    reset_caret(main, s);
 }
 
 /// 鼠标是否位于某张任务卡片的勾选圈或删除按钮上（用于切换手形光标）。
@@ -236,18 +503,25 @@ unsafe extern "system" fn task_wndproc(
             }
             if p.y < TITLE_H + HEADER_H && p.x > WIN_W - 60 {
                 s.input_visible = !s.input_visible;
-                if s.input_visible { s.input_buffer.clear(); }
+                if s.input_visible {
+                    s.input_buffer.clear();
+                    s.input_date = None;
+                }
                 InvalidateRect(hwnd, None, false);
                 reset_caret(hwnd, s);
                 return LRESULT(0);
             }
             if s.input_visible && p.y >= TITLE_H + HEADER_H && p.y < TITLE_H + HEADER_H + INPUT_H {
-                SetFocus(hwnd);
-                reset_caret(hwnd, s);
+                if in_rect(chip_rect(s), p) {
+                    toggle_calendar(hwnd);
+                } else {
+                    SetFocus(hwnd);
+                    reset_caret(hwnd, s);
+                }
                 return LRESULT(0);
             }
             let top = list_top(s) - s.scroll_y;
-            let tasks = s.store.lock().unwrap().all().to_vec();
+            let tasks = s.store.lock().unwrap().all();
             let mut idx = 0i32;
             for task in &tasks {
                 let y0 = top + idx * (CARD_H + CARD_GAP);
@@ -292,7 +566,7 @@ unsafe extern "system" fn task_wndproc(
                 } else if p.y < TITLE_H + HEADER_H {
                     if p.x > WIN_W - 60 { IDC_HAND } else { IDC_ARROW }
                 } else if s.input_visible && p.y < TITLE_H + HEADER_H + INPUT_H {
-                    IDC_IBEAM
+                    if in_rect(chip_rect(s), p) { IDC_HAND } else { IDC_IBEAM }
                 } else if over_card_action(s, p.x, p.y) {
                     IDC_HAND
                 } else {
@@ -325,9 +599,11 @@ unsafe extern "system" fn task_wndproc(
                     13 => {
                         let title = s.input_buffer.trim().to_string();
                         if !title.is_empty() {
-                            s.store.lock().unwrap().add(&title);
+                            let date = s.input_date.clone();
+                            s.store.lock().unwrap().add(&title, date.as_deref());
                         }
                         s.input_buffer.clear();
+                        s.input_date = None;
                         s.input_visible = false;
                         InvalidateRect(hwnd, None, false);
                         reset_caret(hwnd, s);
@@ -339,6 +615,7 @@ unsafe extern "system" fn task_wndproc(
                     }
                     27 => {
                         s.input_buffer.clear();
+                        s.input_date = None;
                         s.input_visible = false;
                         InvalidateRect(hwnd, None, false);
                         reset_caret(hwnd, s);
@@ -371,33 +648,6 @@ unsafe fn invalidate_input(hwnd: HWND) {
         bottom: TITLE_H + HEADER_H + INPUT_H,
     };
     InvalidateRect(hwnd, Some(&rc), false);
-}
-
-/// 圆角抗锯齿：内部像素 alpha=255；四个角落按圆弧覆盖率渐变写 alpha（RGB 同步预乘）。
-unsafe fn round_corner_alpha(px: *mut u32, w: i32, h: i32, r: i32) {
-    let rf = r as f32;
-    for y in 0..h {
-        for x in 0..w {
-            let p = px.offset((y * w + x) as isize);
-            let in_corner = (x < r || x >= w - r) && (y < r || y >= h - r);
-            if !in_corner {
-                *p |= 0xFF00_0000;
-                continue;
-            }
-            let ccx = if x < r { rf } else { (w - r) as f32 };
-            let ccy = if y < r { rf } else { (h - r) as f32 };
-            let dx = x as f32 + 0.5 - ccx;
-            let dy = y as f32 + 0.5 - ccy;
-            let d = (dx * dx + dy * dy).sqrt();
-            let cov = (rf + 0.5 - d).clamp(0.0, 1.0);
-            let v = *p;
-            let bp = ((v & 0xFF) as f32 * cov) as u32;
-            let gp = (((v >> 8) & 0xFF) as f32 * cov) as u32;
-            let rp = (((v >> 16) & 0xFF) as f32 * cov) as u32;
-            let ap = (cov * 255.0) as u32;
-            *p = (ap << 24) | (rp << 16) | (gp << 8) | bp;
-        }
-    }
 }
 
 unsafe fn paint(hwnd: HWND) {
@@ -453,8 +703,25 @@ unsafe fn paint(hwnd: HWND) {
             rgb(C_CARD.0, C_CARD.1, C_CARD.2), rgb(C_PURPLE.0, C_PURPLE.1, C_PURPLE.2), 1.0);
         let text = if s.input_buffer.is_empty() { "输入新任务..." } else { &s.input_buffer };
         let color = if s.input_buffer.is_empty() { rgb(150, 150, 150) } else { rgb(C_TEXT.0, C_TEXT.1, C_TEXT.2) };
-        let txt_rc = RECT { left: 20 + 12, top: in_y + 5, right: WIN_W - 20 - 12, bottom: in_y + INPUT_H - 5 };
-        gdi::draw_text(mem, text, txt_rc, color, DT_LEFT | DT_VCENTER | DT_SINGLELINE, s.font_item);
+        let chip = chip_rect(s);
+        let txt_rc = RECT { left: 20 + 12, top: in_y + 5, right: chip.left - 8, bottom: in_y + INPUT_H - 5 };
+        gdi::draw_text(mem, text, txt_rc, color,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, s.font_item);
+
+        // 日期胶囊：未选日期时显示「选择日期」，已选时显示 26-11-08
+        let (chip_border, chip_text_color) = if s.input_date.is_some() {
+            (rgb(C_PURPLE.0, C_PURPLE.1, C_PURPLE.2), rgb(C_PURPLE.0, C_PURPLE.1, C_PURPLE.2))
+        } else {
+            (rgb(C_BORDER.0, C_BORDER.1, C_BORDER.2), rgb(150, 150, 150))
+        };
+        gdi::round_rect_aa(bits as *mut u32, WIN_W, full, chip, 9.0,
+            rgb(C_WHITE.0, C_WHITE.1, C_WHITE.2), chip_border, 1.0);
+        let label = match &s.input_date {
+            Some(d) => short_date(d),
+            None => "选择日期".to_string(),
+        };
+        gdi::draw_text(mem, &label, chip, chip_text_color,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE, s.font_date);
 
         // 自绘插入光标（1px 竖线，闪烁节奏与系统一致）
         if s.caret_on && caret_active(hwnd, s) {
@@ -467,7 +734,7 @@ unsafe fn paint(hwnd: HWND) {
             SelectObject(mem, old_font);
             let ch = if sz.cy > 0 { sz.cy } else { 20 };
             let left = 20 + 12;
-            let x = (left + sz.cx).clamp(left, WIN_W - 20 - 12 - 1);
+            let x = (left + sz.cx).clamp(left, txt_rc.right - 1);
             let cy = TITLE_H + HEADER_H;
             let caret_rc = RECT { left: x, top: cy + (INPUT_H - ch) / 2, right: x + 1, bottom: cy + (INPUT_H - ch) / 2 + ch };
             let brush = CreateSolidBrush(rgb(C_TEXT.0, C_TEXT.1, C_TEXT.2));
@@ -478,7 +745,7 @@ unsafe fn paint(hwnd: HWND) {
 
     // 任务列表（裁剪到列表区，支持滚轮滚动）
     let top = list_top(s);
-    let tasks = s.store.lock().unwrap().all().to_vec();
+    let tasks = s.store.lock().unwrap().all();
     let maxs = scroll_max(tasks.len(), top);
     if s.scroll_y > maxs { s.scroll_y = maxs; }
     let saved = SaveDC(mem);
@@ -491,7 +758,7 @@ unsafe fn paint(hwnd: HWND) {
     }
     RestoreDC(mem, saved);
 
-    round_corner_alpha(bits as *mut u32, WIN_W, WIN_H, CORNER_R);
+    gdi::round_corner_alpha(bits as *mut u32, WIN_W, WIN_H, CORNER_R);
 
     let mut rc = RECT::default();
     let _ = GetWindowRect(hwnd, &mut rc);
@@ -548,9 +815,35 @@ unsafe fn draw_card(
 
     let text_color = if task.completed { C_MUTED } else { C_TEXT };
     let font = if task.completed { s.font_item_done } else { s.font_item };
-    let txt = RECT { left: MARGIN_X + 15 + 34, top: y, right: WIN_W - MARGIN_X - 50, bottom: y + CARD_H };
+    let date_txt = task.display_date();
+    // 日期用 TextOut 精确右对齐（不做矩形裁剪，杜绝字形被切掉）
+    let date_right = WIN_W - MARGIN_X - 24 - 12 - 6;
+    let (date_w, date_h) = match &date_txt {
+        Some(d) => {
+            let mut sz = SIZE::default();
+            let old = SelectObject(hdc, s.font_date);
+            let wide: Vec<u16> = d.encode_utf16().collect();
+            GetTextExtentPoint32W(hdc, &wide, &mut sz);
+            SelectObject(hdc, old);
+            (if sz.cx > 0 { sz.cx } else { 56 }, if sz.cy > 0 { sz.cy } else { 18 })
+        }
+        None => (0, 0),
+    };
+    let title_right = if date_txt.is_some() {
+        date_right - date_w - 10
+    } else {
+        WIN_W - MARGIN_X - 50
+    };
+    let txt = RECT { left: MARGIN_X + 15 + 34, top: y, right: title_right, bottom: y + CARD_H };
     gdi::draw_text(hdc, &task.title, txt, rgb(text_color.0, text_color.1, text_color.2),
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, font);
+
+    // 设定了日期的任务，在标题右侧显示 26-11-08
+    if let Some(d) = date_txt {
+        let date_color = if task.completed { C_DEL } else { C_MUTED };
+        gdi::text_out(hdc, &d, date_right - date_w, y + (CARD_H - date_h) / 2,
+            rgb(date_color.0, date_color.1, date_color.2), s.font_date);
+    }
 
     let del = RECT { left: WIN_W - MARGIN_X - 24 - 12, top: y, right: WIN_W - MARGIN_X, bottom: y + CARD_H };
     gdi::draw_text(hdc, "×", del, rgb(C_DEL.0, C_DEL.1, C_DEL.2),
@@ -563,4 +856,246 @@ fn point_from_lparam(lp: LPARAM) -> POINT {
         x: (v & 0xFFFF) as i16 as i32,
         y: ((v >> 16) & 0xFFFF) as i16 as i32,
     }
+}
+
+/// 月份翻页。
+fn shift_month(cal: &mut CalState, delta: i32) {
+    let mut m = cal.view_month as i32 + delta;
+    let mut y = cal.view_year;
+    if m < 1 {
+        m = 12;
+        y -= 1;
+    } else if m > 12 {
+        m = 1;
+        y += 1;
+    }
+    cal.view_month = m as u32;
+    cal.view_year = y;
+    cal.hover = CAL_HIT_NONE;
+}
+
+unsafe extern "system" fn cal_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if CAL.is_null() {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    let cal = &mut *CAL;
+    match msg {
+        WM_PAINT => {
+            cal_paint(hwnd);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let p = point_from_lparam(lparam);
+            let hit = cal_hit(cal, p);
+            if hit != cal.hover {
+                cal.hover = hit;
+                InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+        WM_SETCURSOR => {
+            if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                let _ = ScreenToClient(hwnd, &mut p);
+                let icon = if cal_hit(cal, p) != CAL_HIT_NONE { IDC_HAND } else { IDC_ARROW };
+                SetCursor(LoadCursorW(None, icon).unwrap_or_default());
+                return LRESULT(1);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_LBUTTONDOWN => {
+            let p = point_from_lparam(lparam);
+            let hit = cal_hit(cal, p);
+            match hit {
+                CAL_HIT_PREV => {
+                    shift_month(cal, -1);
+                    InvalidateRect(hwnd, None, false);
+                }
+                CAL_HIT_NEXT => {
+                    shift_month(cal, 1);
+                    InvalidateRect(hwnd, None, false);
+                }
+                CAL_HIT_TODAY => apply_date(Some(today())),
+                CAL_HIT_CLEAR => apply_date(None),
+                idx if idx >= 0 => {
+                    if let Some(day) = cal_day_at(cal, idx) {
+                        let iso = format!("{:04}-{:02}-{:02}", cal.view_year, cal.view_month, day);
+                        apply_date(Some(iso));
+                    }
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            if wparam.0 as u16 == VK_ESCAPE.0 {
+                let main = st().hwnd;
+                hide_calendar();
+                SetForegroundWindow(main);
+                SetFocus(main);
+            }
+            LRESULT(0)
+        }
+        // 点到别处（任务窗口或其他程序）时收起弹层
+        WM_ACTIVATE => {
+            if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                hide_calendar();
+            }
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe fn cal_paint(hwnd: HWND) {
+    if CAL.is_null() {
+        return;
+    }
+    let cal = &mut *CAL;
+    let mut ps = PAINTSTRUCT::default();
+    let _ = BeginPaint(hwnd, &mut ps);
+
+    let screen = GetDC(None);
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = CAL_W;
+    bmi.bmiHeader.biHeight = -CAL_H; // 自上而下
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB.0 as u32;
+
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let bmp = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+    let mem = CreateCompatibleDC(screen);
+    let old_bmp = SelectObject(mem, bmp);
+
+    let full = RECT { left: 0, top: 0, right: CAL_W, bottom: CAL_H };
+    let bg = CreateSolidBrush(rgb(C_WHITE.0, C_WHITE.1, C_WHITE.2));
+    FillRect(mem, &full, bg);
+    DeleteObject(bg);
+    gdi::round_rect_aa(bits as *mut u32, CAL_W, full, full, 12.0,
+        rgb(C_WHITE.0, C_WHITE.1, C_WHITE.2), rgb(C_BORDER.0, C_BORDER.1, C_BORDER.2), 1.0);
+
+    let purple = rgb(C_PURPLE.0, C_PURPLE.1, C_PURPLE.2);
+    let muted = rgb(C_MUTED.0, C_MUTED.1, C_MUTED.2);
+    let text = rgb(C_TEXT.0, C_TEXT.1, C_TEXT.2);
+
+    // 月份导航（矢量抗锯齿箭头，避免字形锯齿）
+    let prev = cal_prev_rect();
+    let next = cal_next_rect();
+    gdi::draw_chevron_aa(bits as *mut u32, CAL_W, full, prev,
+        true, 2.4, if cal.hover == CAL_HIT_PREV { purple } else { muted });
+    gdi::draw_chevron_aa(bits as *mut u32, CAL_W, full, next,
+        false, 2.4, if cal.hover == CAL_HIT_NEXT { purple } else { muted });
+    let title = format!("{}年{}月", cal.view_year, cal.view_month);
+    let trc = RECT {
+        left: CAL_PAD + 30,
+        top: CAL_HDR_Y,
+        right: CAL_W - CAL_PAD - 30,
+        bottom: CAL_HDR_Y + CAL_HDR_H,
+    };
+    gdi::draw_text(mem, &title, trc, text, DT_CENTER | DT_VCENTER | DT_SINGLELINE, cal.font_hdr);
+
+    // 星期行
+    let names = ["日", "一", "二", "三", "四", "五", "六"];
+    for (i, n) in names.iter().enumerate() {
+        let rc = RECT {
+            left: CAL_PAD + i as i32 * CAL_CELL,
+            top: CAL_GRID_Y - CAL_WEEK_H,
+            right: CAL_PAD + (i as i32 + 1) * CAL_CELL,
+            bottom: CAL_GRID_Y,
+        };
+        let c = if i == 0 || i == 6 { rgb(C_WEEKEND.0, C_WEEKEND.1, C_WEEKEND.2) } else { muted };
+        gdi::draw_text(mem, n, rc, c, DT_CENTER | DT_VCENTER | DT_SINGLELINE, cal.font_week);
+    }
+
+    // 日期网格
+    let today_d = Local::now().date_naive();
+    let sel = st()
+        .input_date
+        .as_deref()
+        .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+    for idx in 0..CAL_ROWS * 7 {
+        let day = match cal_day_at(cal, idx) {
+            Some(d) => d,
+            None => continue,
+        };
+        let rc = cal_day_rect(idx);
+        let inner = RECT { left: rc.left + 3, top: rc.top + 3, right: rc.right - 3, bottom: rc.bottom - 3 };
+        if cal.hover == idx {
+            gdi::round_rect_aa(bits as *mut u32, CAL_W, full, inner, 8.0,
+                rgb(C_HOVER.0, C_HOVER.1, C_HOVER.2), rgb(C_HOVER.0, C_HOVER.1, C_HOVER.2), 0.0);
+        }
+        let is_sel = sel.map_or(false, |d| {
+            d.year() == cal.view_year && d.month() == cal.view_month && d.day() == day
+        });
+        let is_today = today_d.year() == cal.view_year
+            && today_d.month() == cal.view_month
+            && today_d.day() == day;
+        if is_sel {
+            gdi::fill_ellipse_aa(bits as *mut u32, CAL_W, full, inner, purple);
+            gdi::draw_text(mem, &day.to_string(), rc, rgb(C_WHITE.0, C_WHITE.1, C_WHITE.2),
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE, cal.font_day);
+        } else {
+            let c = if is_today {
+                purple
+            } else if idx % 7 == 0 || idx % 7 == 6 {
+                rgb(C_WEEKEND.0, C_WEEKEND.1, C_WEEKEND.2)
+            } else {
+                text
+            };
+            gdi::draw_text(mem, &day.to_string(), rc, c,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE, cal.font_day);
+        }
+    }
+
+    // 底部：「今天」/「不设日期」
+    for (i, label) in ["今天", "不设日期"].iter().enumerate() {
+        let rc = cal_footer_rect(i as i32);
+        let hovered = cal.hover == CAL_HIT_TODAY + i as i32;
+        gdi::round_rect_aa(bits as *mut u32, CAL_W, full, rc, 8.0,
+            rgb(C_CARD.0, C_CARD.1, C_CARD.2),
+            if hovered { purple } else { rgb(C_BORDER.0, C_BORDER.1, C_BORDER.2) },
+            1.0);
+        gdi::draw_text(mem, label, rc, if hovered { purple } else { muted },
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE, cal.font_week);
+    }
+
+    gdi::round_corner_alpha(bits as *mut u32, CAL_W, CAL_H, 12);
+
+    let mut rc = RECT::default();
+    let _ = GetWindowRect(hwnd, &mut rc);
+    let pt_dst = POINT { x: rc.left, y: rc.top };
+    let pt_src = POINT { x: 0, y: 0 };
+    let sz = SIZE { cx: CAL_W, cy: CAL_H };
+    let blend = BLENDFUNCTION {
+        BlendOp: 0,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: 1,
+    };
+    let _ = UpdateLayeredWindow(
+        hwnd,
+        None,
+        Some(&pt_dst),
+        Some(&sz),
+        mem,
+        Some(&pt_src),
+        COLORREF(0),
+        Some(&blend),
+        ULW_ALPHA,
+    );
+
+    SelectObject(mem, old_bmp);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(None, screen);
+    EndPaint(hwnd, &ps);
 }

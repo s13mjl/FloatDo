@@ -44,6 +44,16 @@ pub unsafe fn draw_text(
     SelectObject(hdc, old);
 }
 
+/// 在指定坐标绘制单行文本（不做矩形裁剪，适合按字节宽精确定位的短文本）。
+pub unsafe fn text_out(hdc: HDC, text: &str, x: i32, y: i32, color: COLORREF, font: HFONT) {
+    let old = SelectObject(hdc, font);
+    SetTextColor(hdc, color);
+    SetBkMode(hdc, TRANSPARENT);
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    TextOutW(hdc, x, y, &wide);
+    SelectObject(hdc, old);
+}
+
 /// 填充 + 描边的抗锯齿圆角矩形（逐像素写入 DIB，clip 为裁剪区域）。
 pub unsafe fn round_rect_aa(
     px: *mut u32,
@@ -273,6 +283,89 @@ pub unsafe fn blit_bgra(hdc: HDC, dst: RECT, px: &[u8], w: i32, h: i32) {
         DeleteDC(hdc_mem);
     }
     ReleaseDC(None, hdc_screen);
+}
+
+/// 圆角抗锯齿：内部像素 alpha=255；四个角落按圆弧覆盖率渐变写 alpha（RGB 同步预乘）。
+pub unsafe fn round_corner_alpha(px: *mut u32, w: i32, h: i32, r: i32) {
+    let rf = r as f32;
+    for y in 0..h {
+        for x in 0..w {
+            let p = px.offset((y * w + x) as isize);
+            let in_corner = (x < r || x >= w - r) && (y < r || y >= h - r);
+            if !in_corner {
+                *p |= 0xFF00_0000;
+                continue;
+            }
+            let ccx = if x < r { rf } else { (w - r) as f32 };
+            let ccy = if y < r { rf } else { (h - r) as f32 };
+            let dx = x as f32 + 0.5 - ccx;
+            let dy = y as f32 + 0.5 - ccy;
+            let d = (dx * dx + dy * dy).sqrt();
+            let cov = (rf + 0.5 - d).clamp(0.0, 1.0);
+            let v = *p;
+            let bp = ((v & 0xFF) as f32 * cov) as u32;
+            let gp = (((v >> 8) & 0xFF) as f32 * cov) as u32;
+            let rp = (((v >> 16) & 0xFF) as f32 * cov) as u32;
+            let ap = (cov * 255.0) as u32;
+            *p = (ap << 24) | (rp << 16) | (gp << 8) | bp;
+        }
+    }
+}
+
+/// 点到线段的距离。
+#[inline]
+fn dist_to_seg(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
+    let vx = b.0 - a.0;
+    let vy = b.1 - a.1;
+    let wx = px - a.0;
+    let wy = py - a.1;
+    let len2 = vx * vx + vy * vy;
+    let t = if len2 > 0.0 {
+        ((wx * vx + wy * vy) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let dx = wx - vx * t;
+    let dy = wy - vy * t;
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// 抗锯齿的 V 形箭头（< / >），point_left 表示箭头朝左。
+pub unsafe fn draw_chevron_aa(
+    px: *mut u32,
+    stride: i32,
+    clip: RECT,
+    rect: RECT,
+    point_left: bool,
+    width: f32,
+    color: COLORREF,
+) {
+    let cx = (rect.left + rect.right) as f32 * 0.5;
+    let cy = (rect.top + rect.bottom) as f32 * 0.5;
+    let half_h = 7.5;
+    let half_w = 5.0;
+    let tip_x = if point_left { cx - half_w } else { cx + half_w };
+    let arm_x = if point_left { cx + half_w } else { cx - half_w };
+    let tip = (tip_x, cy);
+    let arm_top = (arm_x, cy - half_h);
+    let arm_bot = (arm_x, cy + half_h);
+    let (r, g, b) = unpack(color);
+    let half = width * 0.5;
+    let x0 = rect.left.max(clip.left).max(0);
+    let y0 = rect.top.max(clip.top).max(0);
+    let x1 = rect.right.min(clip.right);
+    let y1 = rect.bottom.min(clip.bottom);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+            let d = dist_to_seg(fx, fy, tip, arm_top).min(dist_to_seg(fx, fy, tip, arm_bot));
+            let cov = (half + 0.5 - d).clamp(0.0, 1.0);
+            if cov > 0.0 {
+                blend_px(px, (y * stride + x) as usize, r, g, b, cov);
+            }
+        }
+    }
 }
 
 /// 渲染悬浮球像素（预乘 BGRA）。breath ∈ [0,1] 光晕脉动，anim_scale 缩放动画。
