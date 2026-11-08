@@ -38,7 +38,9 @@ pub unsafe fn draw_text(
     let old = SelectObject(hdc, font);
     SetTextColor(hdc, color);
     SetBkMode(hdc, TRANSPARENT);
-    let mut wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    // 不追加结尾 0：windows crate 会把切片长度作为 cchText，
+    // 多加一个 NUL 会被 DrawText 当成一个额外字符参与排版，导致文字整体偏左
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
     let mut r = rect;
     DrawTextW(hdc, &mut wide, &mut r, flags);
     SelectObject(hdc, old);
