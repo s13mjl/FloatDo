@@ -101,9 +101,24 @@ impl TaskStore {
         false
     }
 
+    /// 修改已有任务的标题与日期；未找到返回 false。
+    pub fn update(&mut self, id: &str, title: &str, due_date: Option<&str>) -> bool {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+            t.title = title.to_string();
+            t.due_date = due_date.map(|d| d.to_string());
+            self.save();
+            return true;
+        }
+        false
+    }
+
     pub fn delete(&mut self, id: &str) {
         self.tasks.retain(|t| t.id != id);
         self.save();
+    }
+
+    pub fn count(&self) -> usize {
+        self.tasks.len()
     }
 
     /// 列表视图：日期早的排在上面，晚的在下面；

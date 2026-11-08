@@ -8,7 +8,8 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE,
+    GetFocus, ReleaseCapture, SetCapture, SetFocus, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME,
+    VK_LEFT, VK_RIGHT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
@@ -67,6 +68,10 @@ pub struct TaskWinState {
     pub input_buffer: String,
     /// 新建任务时选择的日期（YYYY-MM-DD），None 表示不设定日期。
     pub input_date: Option<String>,
+    /// 插入光标在 input_buffer 中的字符位置（0 表示行首）。
+    pub input_caret: usize,
+    /// 正在编辑的任务 id；None 表示输入框用于新建任务。
+    pub editing_id: Option<String>,
     pub drag_off: POINT,
     pub dragging: bool,
     pub font_title: HFONT,
@@ -133,6 +138,8 @@ pub fn create(store: Arc<Mutex<TaskStore>>) {
             input_visible: false,
             input_buffer: String::new(),
             input_date: None,
+            input_caret: 0,
+            editing_id: None,
             drag_off: POINT::default(),
             dragging: false,
             font_title,
@@ -239,6 +246,62 @@ fn chip_rect(s: &TaskWinState) -> RECT {
 
 fn in_rect(rc: RECT, p: POINT) -> bool {
     p.x >= rc.left && p.x < rc.right && p.y >= rc.top && p.y < rc.bottom
+}
+
+// ---------- 输入框文本编辑（按字符位置，兼容中文） ----------
+
+fn buf_char_count(buf: &str) -> usize {
+    buf.chars().count()
+}
+
+fn buf_byte_index(buf: &str, char_idx: usize) -> usize {
+    buf.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(buf.len())
+}
+
+fn buf_insert(buf: &mut String, char_idx: usize, ch: char) {
+    let at = buf_byte_index(buf, char_idx);
+    buf.insert(at, ch);
+}
+
+fn buf_remove_before(buf: &mut String, char_idx: usize) {
+    if char_idx == 0 {
+        return;
+    }
+    let start = buf_byte_index(buf, char_idx - 1);
+    let end = buf_byte_index(buf, char_idx);
+    buf.replace_range(start..end, "");
+}
+
+fn buf_remove_at(buf: &mut String, char_idx: usize) {
+    if char_idx >= buf_char_count(buf) {
+        return;
+    }
+    let start = buf_byte_index(buf, char_idx);
+    let end = buf_byte_index(buf, char_idx + 1);
+    buf.replace_range(start..end, "");
+}
+
+/// 退出编辑/新建状态并清空输入框。
+fn clear_input(s: &mut TaskWinState) {
+    s.input_buffer.clear();
+    s.input_date = None;
+    s.input_caret = 0;
+    s.editing_id = None;
+    s.input_visible = false;
+}
+
+/// 进入编辑状态：把已设定任务的标题与日期载入输入框。
+unsafe fn begin_edit(task: &crate::store::Task) {
+    let s = st();
+    s.input_visible = true;
+    s.editing_id = Some(task.id.clone());
+    s.input_buffer = task.title.clone();
+    s.input_date = task.due_date.clone();
+    s.input_caret = buf_char_count(&s.input_buffer);
+    let hwnd = s.hwnd;
+    SetFocus(hwnd);
+    reset_caret(hwnd, s);
+    InvalidateRect(hwnd, None, false);
 }
 
 // ---------- 日期选择弹层（全自绘） ----------
@@ -408,15 +471,17 @@ unsafe fn apply_date(date: Option<String>) {
     reset_caret(main, s);
 }
 
-/// 鼠标是否位于某张任务卡片的勾选圈或删除按钮上（用于切换手形光标）。
+/// 鼠标是否位于某张任务卡片上（用于切换手形光标，卡片可点击编辑）。
 fn over_card_action(s: &TaskWinState, x: i32, y: i32) -> bool {
-    let count = s.store.lock().unwrap().all().len() as i32;
+    if x < MARGIN_X || x > WIN_W - MARGIN_X {
+        return false;
+    }
+    let count = s.store.lock().unwrap().count() as i32;
     let top = list_top(s) - s.scroll_y;
     for idx in 0..count {
         let y0 = top + idx * (CARD_H + CARD_GAP);
         if y >= y0 && y <= y0 + CARD_H {
-            return (x >= MARGIN_X + 15 && x <= MARGIN_X + 15 + 22)
-                || (x >= WIN_W - MARGIN_X - 24 - 12 && x <= WIN_W - MARGIN_X);
+            return true;
         }
     }
     false
@@ -502,11 +567,9 @@ unsafe extern "system" fn task_wndproc(
                 return LRESULT(0);
             }
             if p.y < TITLE_H + HEADER_H && p.x > WIN_W - 60 {
-                s.input_visible = !s.input_visible;
-                if s.input_visible {
-                    s.input_buffer.clear();
-                    s.input_date = None;
-                }
+                let open = !s.input_visible;
+                clear_input(s);
+                s.input_visible = open;
                 InvalidateRect(hwnd, None, false);
                 reset_caret(hwnd, s);
                 return LRESULT(0);
@@ -536,9 +599,21 @@ unsafe extern "system" fn task_wndproc(
                     if p.x >= WIN_W - MARGIN_X - 24 - 12 && p.x <= WIN_W - MARGIN_X {
                         let id = task.id.clone();
                         s.store.lock().unwrap().delete(&id);
+                        if s.editing_id.as_deref() == Some(id.as_str()) {
+                            clear_input(s);
+                        }
                         InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
+                    // 卡片其余区域 → 编辑该任务的文本与日期
+                    if s.editing_id.as_deref() != Some(task.id.as_str()) {
+                        let target = task.clone();
+                        begin_edit(&target);
+                    } else {
+                        SetFocus(hwnd);
+                        reset_caret(hwnd, s);
+                    }
+                    return LRESULT(0);
                 }
                 idx += 1;
             }
@@ -586,10 +661,43 @@ unsafe extern "system" fn task_wndproc(
             let s = st();
             let delta = ((wparam.0 >> 16) as i16) as i32;
             let step = -delta / 120 * (CARD_H + CARD_GAP);
-            let maxs = scroll_max(s.store.lock().unwrap().all().len(), list_top(s));
+            let maxs = scroll_max(s.store.lock().unwrap().count(), list_top(s));
             s.scroll_y = (s.scroll_y + step).clamp(0, maxs);
             InvalidateRect(hwnd, None, false);
             LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            let mut handled = false;
+            let s = st();
+            if s.input_visible {
+                let vk = wparam.0 as u16;
+                let len = buf_char_count(&s.input_buffer);
+                if vk == VK_LEFT.0 && s.input_caret > 0 {
+                    s.input_caret -= 1;
+                    handled = true;
+                } else if vk == VK_RIGHT.0 && s.input_caret < len {
+                    s.input_caret += 1;
+                    handled = true;
+                } else if vk == VK_HOME.0 && s.input_caret > 0 {
+                    s.input_caret = 0;
+                    handled = true;
+                } else if vk == VK_END.0 && s.input_caret < len {
+                    s.input_caret = len;
+                    handled = true;
+                } else if vk == VK_DELETE.0 && s.input_caret < len {
+                    buf_remove_at(&mut s.input_buffer, s.input_caret);
+                    handled = true;
+                }
+                if handled {
+                    invalidate_input(hwnd);
+                    reset_caret(hwnd, s);
+                }
+            }
+            if handled {
+                LRESULT(0)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
         }
         WM_CHAR => {
             let s = st();
@@ -600,30 +708,39 @@ unsafe extern "system" fn task_wndproc(
                         let title = s.input_buffer.trim().to_string();
                         if !title.is_empty() {
                             let date = s.input_date.clone();
-                            s.store.lock().unwrap().add(&title, date.as_deref());
+                            let editing = s.editing_id.clone();
+                            let mut store = s.store.lock().unwrap();
+                            match editing {
+                                Some(id) => {
+                                    store.update(&id, &title, date.as_deref());
+                                }
+                                None => {
+                                    store.add(&title, date.as_deref());
+                                }
+                            }
                         }
-                        s.input_buffer.clear();
-                        s.input_date = None;
-                        s.input_visible = false;
+                        clear_input(s);
                         InvalidateRect(hwnd, None, false);
                         reset_caret(hwnd, s);
                     }
                     8 => {
-                        s.input_buffer.pop();
-                        invalidate_input(hwnd);
-                        reset_caret(hwnd, s);
+                        if s.input_caret > 0 {
+                            buf_remove_before(&mut s.input_buffer, s.input_caret);
+                            s.input_caret -= 1;
+                            invalidate_input(hwnd);
+                            reset_caret(hwnd, s);
+                        }
                     }
                     27 => {
-                        s.input_buffer.clear();
-                        s.input_date = None;
-                        s.input_visible = false;
+                        clear_input(s);
                         InvalidateRect(hwnd, None, false);
                         reset_caret(hwnd, s);
                     }
                     _ => {
                         if let Some(ch) = char::from_u32(c) {
                             if !ch.is_control() {
-                                s.input_buffer.push(ch);
+                                buf_insert(&mut s.input_buffer, s.input_caret, ch);
+                                s.input_caret += 1;
                                 invalidate_input(hwnd);
                                 reset_caret(hwnd, s);
                             }
@@ -727,7 +844,8 @@ unsafe fn paint(hwnd: HWND) {
         if s.caret_on && caret_active(hwnd, s) {
             let mut sz = SIZE::default();
             let old_font = SelectObject(mem, s.font_item);
-            let wide: Vec<u16> = s.input_buffer.encode_utf16().collect();
+            let prefix: String = s.input_buffer.chars().take(s.input_caret).collect();
+            let wide: Vec<u16> = prefix.encode_utf16().collect();
             if !wide.is_empty() {
                 GetTextExtentPoint32W(mem, &wide, &mut sz);
             }
@@ -800,9 +918,13 @@ unsafe fn draw_card(
     y: i32,
 ) {
     let bg = if task.completed { C_CARD_DONE } else { C_CARD };
+    // 正在编辑的任务用紫色描边标记
+    let editing = s.editing_id.as_deref() == Some(task.id.as_str());
+    let border = if editing { C_PURPLE } else { C_BORDER };
     let card = RECT { left: MARGIN_X, top: y, right: WIN_W - MARGIN_X, bottom: y + CARD_H };
     gdi::round_rect_aa(px, WIN_W, clip, card, 12.0,
-        rgb(bg.0, bg.1, bg.2), rgb(C_BORDER.0, C_BORDER.1, C_BORDER.2), 1.0);
+        rgb(bg.0, bg.1, bg.2), rgb(border.0, border.1, border.2),
+        if editing { 1.5 } else { 1.0 });
 
     let cx = MARGIN_X + 15 + 11;
     let cy = y + CARD_H / 2;
