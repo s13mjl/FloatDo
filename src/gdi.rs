@@ -46,6 +46,66 @@ pub unsafe fn draw_text(
     SelectObject(hdc, old);
 }
 
+/// 抗锯齿圆角矩形描边（只画轮廓，不填充内部）。只扫描边缘附近像素，开销很小。
+pub unsafe fn stroke_round_rect_aa(
+    px: *mut u32,
+    stride: i32,
+    clip: RECT,
+    rect: RECT,
+    radius: f32,
+    width: f32,
+    color: COLORREF,
+) {
+    let x0 = rect.left.max(clip.left).max(0);
+    let y0 = rect.top.max(clip.top).max(0);
+    let x1 = rect.right.min(clip.right);
+    let y1 = rect.bottom.min(clip.bottom);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let cx = (rect.left + rect.right) as f32 * 0.5;
+    let cy = (rect.top + rect.bottom) as f32 * 0.5;
+    let hw = ((rect.right - rect.left) as f32 * 0.5 - radius).max(0.0);
+    let hh = ((rect.bottom - rect.top) as f32 * 0.5 - radius).max(0.0);
+    let half = width * 0.5;
+    let (r, g, b) = unpack(color);
+
+    let plot = |x: i32, y: i32| {
+        let sd = sdf_round_rect(x as f32 + 0.5, y as f32 + 0.5, cx, cy, hw, hh, radius);
+        let cov = (half + 0.5 - sd.abs()).clamp(0.0, 1.0);
+        if cov > 0.0 {
+            blend_px(px, (y * stride + x) as usize, r, g, b, cov);
+        }
+    };
+
+    // 上下按圆角半径扫描整行，中间行只扫左右两条窄带，避免遍历整窗
+    let band = (half + 1.0).ceil() as i32;
+    let arc = radius.ceil() as i32 + band;
+    let top_end = (rect.top + arc).clamp(y0, y1);
+    let bot_start = (rect.bottom - arc).clamp(top_end, y1);
+    let left_end = (rect.left + band).clamp(x0, x1);
+    let right_start = (rect.right - band).clamp(left_end, x1);
+
+    for y in y0..top_end {
+        for x in x0..x1 {
+            plot(x, y);
+        }
+    }
+    for y in bot_start..y1 {
+        for x in x0..x1 {
+            plot(x, y);
+        }
+    }
+    for y in top_end..bot_start {
+        for x in x0..left_end {
+            plot(x, y);
+        }
+        for x in right_start..x1 {
+            plot(x, y);
+        }
+    }
+}
+
 /// 在矩形内居中绘制矢量感叹号（抗锯齿），用于重要性标记。
 /// 不依赖字体字形，避免字形前伸距导致的视觉偏移。
 pub unsafe fn draw_bang_aa(

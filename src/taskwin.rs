@@ -1203,6 +1203,10 @@ unsafe fn paint(hwnd: HWND) {
     }
     RestoreDC(mem, saved);
 
+    // 窗口外轮廓：1px 灰色细线，避免纯白背景下看不清窗口边界
+    gdi::stroke_round_rect_aa(bits as *mut u32, WIN_W, full, full, CORNER_R as f32, 1.6,
+        rgb(194, 199, 205));
+
     gdi::round_corner_alpha(bits as *mut u32, WIN_W, WIN_H, CORNER_R);
 
     let mut rc = RECT::default();
