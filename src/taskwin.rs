@@ -8,8 +8,8 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, ReleaseCapture, SetCapture, SetFocus, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME,
-    VK_LEFT, VK_RIGHT,
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_A, VK_CONTROL, VK_DELETE,
+    VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
@@ -70,6 +70,10 @@ pub struct TaskWinState {
     pub input_date: Option<String>,
     /// 插入光标在 input_buffer 中的字符位置（0 表示行首）。
     pub input_caret: usize,
+    /// 选区起点（字符位置）；与 input_caret 不同时表示存在选区。
+    pub sel_anchor: Option<usize>,
+    /// 是否正在用鼠标拖动选择文本。
+    pub text_dragging: bool,
     /// 正在编辑的任务 id；None 表示输入框用于新建任务。
     pub editing_id: Option<String>,
     pub drag_off: POINT,
@@ -139,6 +143,8 @@ pub fn create(store: Arc<Mutex<TaskStore>>) {
             input_buffer: String::new(),
             input_date: None,
             input_caret: 0,
+            sel_anchor: None,
+            text_dragging: false,
             editing_id: None,
             drag_off: POINT::default(),
             dragging: false,
@@ -281,11 +287,64 @@ fn buf_remove_at(buf: &mut String, char_idx: usize) {
     buf.replace_range(start..end, "");
 }
 
+/// 当前选区（已归一化为 start..end）；无选区返回 None。
+fn sel_range(s: &TaskWinState) -> Option<(usize, usize)> {
+    let anchor = s.sel_anchor?;
+    if anchor == s.input_caret {
+        None
+    } else {
+        Some((anchor.min(s.input_caret), anchor.max(s.input_caret)))
+    }
+}
+
+/// 有选区时删除选区内容（光标落到选区起点）。
+fn delete_selection(s: &mut TaskWinState) -> bool {
+    if let Some((a, b)) = sel_range(s) {
+        let start = buf_byte_index(&s.input_buffer, a);
+        let end = buf_byte_index(&s.input_buffer, b);
+        s.input_buffer.replace_range(start..end, "");
+        s.input_caret = a;
+        s.sel_anchor = None;
+        return true;
+    }
+    false
+}
+
+/// 把输入框内的鼠标 x 坐标换算成最接近的字符位置。
+unsafe fn caret_from_x(s: &TaskWinState, x: i32) -> usize {
+    let left = 20 + 12;
+    let hdc = GetDC(s.hwnd);
+    let old = SelectObject(hdc, s.font_item);
+    let total = buf_char_count(&s.input_buffer);
+    let mut prev_w = 0;
+    let mut result = total;
+    let mut prefix = String::new();
+    let mut idx = 0;
+    for ch in s.input_buffer.chars() {
+        prefix.push(ch);
+        idx += 1;
+        let mut sz = SIZE::default();
+        let wide: Vec<u16> = prefix.encode_utf16().collect();
+        GetTextExtentPoint32W(hdc, &wide, &mut sz);
+        let w = sz.cx;
+        if x < left + prev_w + (w - prev_w) / 2 {
+            result = idx - 1;
+            break;
+        }
+        prev_w = w;
+    }
+    SelectObject(hdc, old);
+    ReleaseDC(s.hwnd, hdc);
+    result
+}
+
 /// 退出编辑/新建状态并清空输入框。
 fn clear_input(s: &mut TaskWinState) {
     s.input_buffer.clear();
     s.input_date = None;
     s.input_caret = 0;
+    s.sel_anchor = None;
+    s.text_dragging = false;
     s.editing_id = None;
     s.input_visible = false;
 }
@@ -298,6 +357,8 @@ unsafe fn begin_edit(task: &crate::store::Task) {
     s.input_buffer = task.title.clone();
     s.input_date = task.due_date.clone();
     s.input_caret = buf_char_count(&s.input_buffer);
+    s.sel_anchor = None;
+    s.text_dragging = false;
     let hwnd = s.hwnd;
     SetFocus(hwnd);
     reset_caret(hwnd, s);
@@ -579,6 +640,11 @@ unsafe extern "system" fn task_wndproc(
                     toggle_calendar(hwnd);
                 } else {
                     SetFocus(hwnd);
+                    let caret = caret_from_x(s, p.x);
+                    s.input_caret = caret;
+                    s.sel_anchor = Some(caret);
+                    s.text_dragging = true;
+                    SetCapture(hwnd);
                     reset_caret(hwnd, s);
                 }
                 return LRESULT(0);
@@ -621,6 +687,14 @@ unsafe extern "system" fn task_wndproc(
         }
         WM_MOUSEMOVE => {
             let s = st();
+            if s.text_dragging {
+                let p = point_from_lparam(lparam);
+                let caret = caret_from_x(s, p.x);
+                if caret != s.input_caret {
+                    s.input_caret = caret;
+                    reset_caret(hwnd, s);
+                }
+            }
             if s.dragging {
                 let mut gp = POINT::default();
                 let _ = GetCursorPos(&mut gp);
@@ -653,8 +727,24 @@ unsafe extern "system" fn task_wndproc(
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONUP => {
-            st().dragging = false;
+            let s = st();
+            if s.text_dragging {
+                s.text_dragging = false;
+                if s.sel_anchor == Some(s.input_caret) {
+                    s.sel_anchor = None;
+                }
+                ReleaseCapture();
+                invalidate_input(hwnd);
+                return LRESULT(0);
+            }
+            s.dragging = false;
             ReleaseCapture();
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            let s = st();
+            s.text_dragging = false;
+            s.dragging = false;
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
@@ -672,21 +762,49 @@ unsafe extern "system" fn task_wndproc(
             if s.input_visible {
                 let vk = wparam.0 as u16;
                 let len = buf_char_count(&s.input_buffer);
-                if vk == VK_LEFT.0 && s.input_caret > 0 {
-                    s.input_caret -= 1;
-                    handled = true;
-                } else if vk == VK_RIGHT.0 && s.input_caret < len {
-                    s.input_caret += 1;
-                    handled = true;
-                } else if vk == VK_HOME.0 && s.input_caret > 0 {
+                let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+                let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+                let old_caret = s.input_caret;
+                let mut moved = false;
+                if vk == VK_LEFT.0 {
+                    if s.input_caret > 0 {
+                        s.input_caret -= 1;
+                    }
+                    moved = true;
+                } else if vk == VK_RIGHT.0 {
+                    if s.input_caret < len {
+                        s.input_caret += 1;
+                    }
+                    moved = true;
+                } else if vk == VK_HOME.0 {
                     s.input_caret = 0;
+                    moved = true;
+                } else if vk == VK_END.0 {
+                    s.input_caret = len;
+                    moved = true;
+                } else if vk == VK_DELETE.0 {
+                    if !delete_selection(s) {
+                        buf_remove_at(&mut s.input_buffer, s.input_caret);
+                    }
+                    s.sel_anchor = None;
                     handled = true;
-                } else if vk == VK_END.0 && s.input_caret < len {
+                } else if vk == VK_A.0 && ctrl {
+                    s.sel_anchor = Some(0);
                     s.input_caret = len;
                     handled = true;
-                } else if vk == VK_DELETE.0 && s.input_caret < len {
-                    buf_remove_at(&mut s.input_buffer, s.input_caret);
+                }
+                if moved {
                     handled = true;
+                    if shift {
+                        if s.sel_anchor.is_none() {
+                            s.sel_anchor = Some(old_caret);
+                        }
+                    } else {
+                        s.sel_anchor = None;
+                    }
+                    if s.sel_anchor == Some(s.input_caret) {
+                        s.sel_anchor = None;
+                    }
                 }
                 if handled {
                     invalidate_input(hwnd);
@@ -724,12 +842,13 @@ unsafe extern "system" fn task_wndproc(
                         reset_caret(hwnd, s);
                     }
                     8 => {
-                        if s.input_caret > 0 {
+                        if !delete_selection(s) && s.input_caret > 0 {
                             buf_remove_before(&mut s.input_buffer, s.input_caret);
                             s.input_caret -= 1;
-                            invalidate_input(hwnd);
-                            reset_caret(hwnd, s);
                         }
+                        s.sel_anchor = None;
+                        invalidate_input(hwnd);
+                        reset_caret(hwnd, s);
                     }
                     27 => {
                         clear_input(s);
@@ -739,8 +858,10 @@ unsafe extern "system" fn task_wndproc(
                     _ => {
                         if let Some(ch) = char::from_u32(c) {
                             if !ch.is_control() {
+                                delete_selection(s);
                                 buf_insert(&mut s.input_buffer, s.input_caret, ch);
                                 s.input_caret += 1;
+                                s.sel_anchor = None;
                                 invalidate_input(hwnd);
                                 reset_caret(hwnd, s);
                             }
@@ -822,6 +943,36 @@ unsafe fn paint(hwnd: HWND) {
         let color = if s.input_buffer.is_empty() { rgb(150, 150, 150) } else { rgb(C_TEXT.0, C_TEXT.1, C_TEXT.2) };
         let chip = chip_rect(s);
         let txt_rc = RECT { left: 20 + 12, top: in_y + 5, right: chip.left - 8, bottom: in_y + INPUT_H - 5 };
+
+        // 选区高亮（铺在文字下方）
+        if let Some((a, b)) = sel_range(s) {
+            let old_font = SelectObject(mem, s.font_item);
+            let mut sz_a = SIZE::default();
+            let prefix_a: String = s.input_buffer.chars().take(a).collect();
+            if !prefix_a.is_empty() {
+                let wa: Vec<u16> = prefix_a.encode_utf16().collect();
+                GetTextExtentPoint32W(mem, &wa, &mut sz_a);
+            }
+            let mut sz_b = SIZE::default();
+            let prefix_b: String = s.input_buffer.chars().take(b).collect();
+            if !prefix_b.is_empty() {
+                let wb: Vec<u16> = prefix_b.encode_utf16().collect();
+                GetTextExtentPoint32W(mem, &wb, &mut sz_b);
+            }
+            SelectObject(mem, old_font);
+            let x0 = (20 + 12 + sz_a.cx).clamp(txt_rc.left, txt_rc.right);
+            let x1 = (20 + 12 + sz_b.cx).clamp(txt_rc.left, txt_rc.right);
+            let hl = RECT {
+                left: x0.min(x1),
+                top: in_y + 8,
+                right: x0.max(x1),
+                bottom: in_y + INPUT_H - 8,
+            };
+            let brush = CreateSolidBrush(rgb(214, 209, 245));
+            FillRect(mem, &hl, brush);
+            DeleteObject(brush);
+        }
+
         gdi::draw_text(mem, text, txt_rc, color,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, s.font_item);
 
