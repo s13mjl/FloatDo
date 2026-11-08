@@ -32,3 +32,6 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[profile.dev]
+opt-level = 2          # 调试构建也开启优化：逐像素自绘在未优化时非常慢

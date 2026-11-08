@@ -26,6 +26,11 @@ const MARGIN_X: i32 = 15;
 const CORNER_R: i32 = 16;
 const TIMER_CARET: usize = 1;
 
+// 任务列表滚动条
+const SB_W: i32 = 6;
+const SB_RIGHT: i32 = 4;
+const SB_MIN_H: i32 = 24;
+
 // 输入框内的日期胶囊
 const DATE_CHIP_W: i32 = 84;
 const DATE_CHIP_H: i32 = 26;
@@ -78,6 +83,10 @@ pub struct TaskWinState {
     pub sel_anchor: Option<usize>,
     /// 是否正在用鼠标拖动选择文本。
     pub text_dragging: bool,
+    /// 是否正在拖动列表滚动条。
+    pub sb_dragging: bool,
+    /// 拖动滚动条时鼠标相对滑块顶部的偏移。
+    pub sb_grab: i32,
     /// 新增或编辑任务时设置的重要性：0 默认、1 重要、2 非常重要。
     pub input_priority: u8,
     /// 正在编辑的任务 id；None 表示输入框用于新建任务。
@@ -92,6 +101,9 @@ pub struct TaskWinState {
     pub font_date: HFONT,
     pub scroll_y: i32,
     pub caret_on: bool,
+    /// 复用的离屏位图内存 DC（DIB 由它长期持有）。
+    pub mem_dc: HDC,
+    pub dib_bits: *mut core::ffi::c_void,
 }
 
 /// 日期选择弹层状态。
@@ -142,6 +154,21 @@ pub fn create(store: Arc<Mutex<TaskStore>>) {
         let font_btn = gdi::make_font(-18, true, false);
         let font_date = gdi::make_font(-13, false, false);
 
+        // 复用的离屏位图：尺寸固定，每帧只需清空重绘，不必反复创建 DIB
+        let screen = GetDC(None);
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = WIN_W;
+        bmi.bmiHeader.biHeight = -WIN_H; // 自上而下
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB.0 as u32;
+        let mut dib_bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &mut dib_bits, None, 0).unwrap();
+        let mem_dc = CreateCompatibleDC(screen);
+        SelectObject(mem_dc, dib);
+        ReleaseDC(None, screen);
+
         let st = Box::leak(Box::new(TaskWinState {
             hwnd,
             store,
@@ -151,6 +178,8 @@ pub fn create(store: Arc<Mutex<TaskStore>>) {
             input_caret: 0,
             sel_anchor: None,
             text_dragging: false,
+            sb_dragging: false,
+            sb_grab: 0,
             input_priority: 0,
             editing_id: None,
             drag_off: POINT::default(),
@@ -163,6 +192,8 @@ pub fn create(store: Arc<Mutex<TaskStore>>) {
             font_date,
             scroll_y: 0,
             caret_on: false,
+            mem_dc,
+            dib_bits,
         }));
         TASKWIN = st;
 
@@ -243,6 +274,64 @@ fn scroll_max(content_len: usize, view_top: i32) -> i32 {
     let content_h = content_len as i32 * (CARD_H + CARD_GAP);
     let view_h = WIN_H - view_top;
     (content_h - view_h).max(0)
+}
+
+// ---------- 列表滚动条 ----------
+
+struct SbMetrics {
+    track: RECT,
+    thumb_h: i32,
+    maxs: i32,
+    travel: i32,
+}
+
+impl SbMetrics {
+    fn thumb(&self, scroll_y: i32) -> RECT {
+        let pos = if self.maxs > 0 {
+            (scroll_y as i64 * self.travel as i64 / self.maxs as i64) as i32
+        } else {
+            0
+        };
+        RECT {
+            left: self.track.left,
+            top: self.track.top + pos,
+            right: self.track.right,
+            bottom: self.track.top + pos + self.thumb_h,
+        }
+    }
+}
+
+/// 内容超出可视区时才返回滚动条几何信息。
+fn sb_metrics_for(s: &TaskWinState, count: usize) -> Option<SbMetrics> {
+    let track = RECT {
+        left: WIN_W - SB_RIGHT - SB_W,
+        top: list_top(s) + 2,
+        right: WIN_W - SB_RIGHT,
+        bottom: WIN_H - 4,
+    };
+    let track_h = track.bottom - track.top;
+    let view_h = WIN_H - list_top(s);
+    let content_h = count as i32 * (CARD_H + CARD_GAP);
+    let maxs = (content_h - view_h).max(0);
+    if maxs == 0 || track_h <= SB_MIN_H {
+        return None;
+    }
+    let total = content_h.max(view_h);
+    let thumb_h = ((track_h * view_h) / total).clamp(SB_MIN_H, track_h);
+    Some(SbMetrics {
+        track,
+        thumb_h,
+        maxs,
+        travel: (track_h - thumb_h).max(0),
+    })
+}
+
+fn sb_metrics(s: &TaskWinState) -> Option<SbMetrics> {
+    sb_metrics_for(s, s.store.lock().unwrap().count())
+}
+
+fn over_scrollbar(s: &TaskWinState, p: POINT) -> bool {
+    sb_metrics(s).map_or(false, |m| in_rect(m.track, p))
 }
 
 /// 输入框右侧「日期」胶囊的矩形。
@@ -673,6 +762,26 @@ unsafe extern "system" fn task_wndproc(
                 }
                 return LRESULT(0);
             }
+            // 滚动条：拖滑块或点轨道翻页
+            if let Some(m) = sb_metrics(s) {
+                let thumb = m.thumb(s.scroll_y);
+                if in_rect(thumb, p) {
+                    s.sb_dragging = true;
+                    s.sb_grab = p.y - thumb.top;
+                    SetCapture(hwnd);
+                    return LRESULT(0);
+                }
+                if in_rect(m.track, p) {
+                    let page = (WIN_H - list_top(s)).max(CARD_H);
+                    if p.y < thumb.top {
+                        s.scroll_y = (s.scroll_y - page).clamp(0, m.maxs);
+                    } else {
+                        s.scroll_y = (s.scroll_y + page).clamp(0, m.maxs);
+                    }
+                    InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
+            }
             let top = list_top(s) - s.scroll_y;
             let tasks = s.store.lock().unwrap().all();
             let mut idx = 0i32;
@@ -711,6 +820,23 @@ unsafe extern "system" fn task_wndproc(
         }
         WM_MOUSEMOVE => {
             let s = st();
+            if s.sb_dragging {
+                let p = point_from_lparam(lparam);
+                if let Some(m) = sb_metrics(s) {
+                    let target = p.y - s.sb_grab - m.track.top;
+                    let new_y = if m.travel > 0 {
+                        ((target.clamp(0, m.travel) as f32 / m.travel as f32) * m.maxs as f32)
+                            .round() as i32
+                    } else {
+                        0
+                    };
+                    // 位置没变就不重绘，避免拖动时每来一个鼠标事件都整窗重画
+                    if new_y != s.scroll_y {
+                        s.scroll_y = new_y;
+                        InvalidateRect(hwnd, None, false);
+                    }
+                }
+            }
             if s.text_dragging {
                 let p = point_from_lparam(lparam);
                 let caret = caret_from_x(s, p.x);
@@ -746,6 +872,8 @@ unsafe extern "system" fn task_wndproc(
                     }
                 } else if over_card_action(s, p.x, p.y) {
                     IDC_HAND
+                } else if over_scrollbar(s, p) {
+                    IDC_HAND
                 } else {
                     IDC_ARROW
                 };
@@ -756,6 +884,11 @@ unsafe extern "system" fn task_wndproc(
         }
         WM_LBUTTONUP => {
             let s = st();
+            if s.sb_dragging {
+                s.sb_dragging = false;
+                ReleaseCapture();
+                return LRESULT(0);
+            }
             if s.text_dragging {
                 s.text_dragging = false;
                 if s.sel_anchor == Some(s.input_caret) {
@@ -772,6 +905,7 @@ unsafe extern "system" fn task_wndproc(
         WM_CAPTURECHANGED => {
             let s = st();
             s.text_dragging = false;
+            s.sb_dragging = false;
             s.dragging = false;
             LRESULT(0)
         }
@@ -924,19 +1058,9 @@ unsafe fn paint(hwnd: HWND) {
 
     // 画入 32 位 DIB，再用 UpdateLayeredWindow 逐像素上屏，
     // 圆角由 alpha 渐变实现抗锯齿（窗口区域裁剪是二值的，做不到平滑边缘）
-    let screen = GetDC(None);
-    let mut bmi = BITMAPINFO::default();
-    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-    bmi.bmiHeader.biWidth = WIN_W;
-    bmi.bmiHeader.biHeight = -WIN_H; // 自上而下
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB.0 as u32;
-
-    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-    let bmp = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
-    let mem = CreateCompatibleDC(screen);
-    let old_bmp = SelectObject(mem, bmp);
+    // DIB 与 DC 在 create() 时创建并复用，这里只清空重绘，避免每帧分配
+    let bits = s.dib_bits;
+    let mem = s.mem_dc;
 
     let full = RECT { left: 0, top: 0, right: WIN_W, bottom: WIN_H };
     let bg = CreateSolidBrush(rgb(C_WHITE.0, C_WHITE.1, C_WHITE.2));
@@ -1068,6 +1192,15 @@ unsafe fn paint(hwnd: HWND) {
         draw_card(mem, bits as *mut u32, clip, s, task, y);
         y += CARD_H + CARD_GAP;
     }
+
+    // 滚动条：内容超出可视区时显示
+    if let Some(m) = sb_metrics_for(s, tasks.len()) {
+        gdi::round_rect_aa(bits as *mut u32, WIN_W, clip, m.track, 3.0,
+            rgb(236, 237, 241), rgb(236, 237, 241), 0.0);
+        let th = m.thumb(s.scroll_y);
+        gdi::round_rect_aa(bits as *mut u32, WIN_W, clip, th, 3.0,
+            rgb(172, 165, 210), rgb(172, 165, 210), 0.0);
+    }
     RestoreDC(mem, saved);
 
     gdi::round_corner_alpha(bits as *mut u32, WIN_W, WIN_H, CORNER_R);
@@ -1094,11 +1227,6 @@ unsafe fn paint(hwnd: HWND) {
         Some(&blend),
         ULW_ALPHA,
     );
-
-    SelectObject(mem, old_bmp);
-    DeleteObject(bmp);
-    DeleteDC(mem);
-    ReleaseDC(None, screen);
 
     EndPaint(hwnd, &ps);
 }
