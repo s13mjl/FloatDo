@@ -44,6 +44,38 @@ pub unsafe fn draw_text(
     SelectObject(hdc, old);
 }
 
+/// 在矩形内居中绘制矢量感叹号（抗锯齿），用于重要性标记。
+/// 不依赖字体字形，避免字形前伸距导致的视觉偏移。
+pub unsafe fn draw_bang_aa(
+    px: *mut u32,
+    stride: i32,
+    clip: RECT,
+    rect: RECT,
+    color: COLORREF,
+) {
+    let unit = (rect.bottom - rect.top) as f32 / 18.0;
+    // 竖条与圆点共用同一个整数中心，避免取整误差造成圆点偏左
+    let cx = (rect.left + rect.right) / 2;
+    let cy = (rect.top + rect.bottom) / 2;
+    let half = ((2.0 * unit).round() as i32).max(1);
+    let bar = RECT {
+        left: cx - half,
+        top: cy - (6.4 * unit).round() as i32,
+        right: cx + half,
+        bottom: cy + (0.6 * unit).round() as i32,
+    };
+    round_rect_aa(px, stride, clip, bar, half as f32, color, color, 0.0);
+
+    let dot_cy = cy + (4.6 * unit).round() as i32;
+    let dot = RECT {
+        left: cx - half,
+        top: dot_cy - half,
+        right: cx + half,
+        bottom: dot_cy + half,
+    };
+    fill_ellipse_aa(px, stride, clip, dot, color);
+}
+
 /// 在指定坐标绘制单行文本（不做矩形裁剪，适合按字节宽精确定位的短文本）。
 pub unsafe fn text_out(hdc: HDC, text: &str, x: i32, y: i32, color: COLORREF, font: HFONT) {
     let old = SelectObject(hdc, font);

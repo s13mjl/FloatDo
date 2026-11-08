@@ -60,6 +60,10 @@ const C_CHK_BORDER: (u8, u8, u8) = (178, 190, 195);
 const C_DEL: (u8, u8, u8) = (178, 190, 195);
 const C_HOVER: (u8, u8, u8) = (238, 237, 250);
 const C_WEEKEND: (u8, u8, u8) = (168, 176, 180);
+const C_PRIO_1: (u8, u8, u8) = (226, 164, 8);
+const C_PRIO_1_BG: (u8, u8, u8) = (250, 238, 205);
+const C_PRIO_2: (u8, u8, u8) = (224, 60, 60);
+const C_PRIO_2_BG: (u8, u8, u8) = (250, 222, 222);
 
 pub struct TaskWinState {
     pub hwnd: HWND,
@@ -74,6 +78,8 @@ pub struct TaskWinState {
     pub sel_anchor: Option<usize>,
     /// 是否正在用鼠标拖动选择文本。
     pub text_dragging: bool,
+    /// 新增或编辑任务时设置的重要性：0 默认、1 重要、2 非常重要。
+    pub input_priority: u8,
     /// 正在编辑的任务 id；None 表示输入框用于新建任务。
     pub editing_id: Option<String>,
     pub drag_off: POINT,
@@ -145,6 +151,7 @@ pub fn create(store: Arc<Mutex<TaskStore>>) {
             input_caret: 0,
             sel_anchor: None,
             text_dragging: false,
+            input_priority: 0,
             editing_id: None,
             drag_off: POINT::default(),
             dragging: false,
@@ -254,6 +261,17 @@ fn in_rect(rc: RECT, p: POINT) -> bool {
     p.x >= rc.left && p.x < rc.right && p.y >= rc.top && p.y < rc.bottom
 }
 
+/// 输入框内「重要性」小按钮（位于日期胶囊左侧，点击循环切换 0→1→2）。
+fn prio_chip_rect(s: &TaskWinState) -> RECT {
+    let chip = chip_rect(s);
+    RECT {
+        left: chip.left - 6 - 32,
+        top: chip.top,
+        right: chip.left - 6,
+        bottom: chip.bottom,
+    }
+}
+
 // ---------- 输入框文本编辑（按字符位置，兼容中文） ----------
 
 fn buf_char_count(buf: &str) -> usize {
@@ -345,11 +363,12 @@ fn clear_input(s: &mut TaskWinState) {
     s.input_caret = 0;
     s.sel_anchor = None;
     s.text_dragging = false;
+    s.input_priority = 0;
     s.editing_id = None;
     s.input_visible = false;
 }
 
-/// 进入编辑状态：把已设定任务的标题与日期载入输入框。
+/// 进入编辑状态：把已设定任务的标题、日期与重要性载入输入框。
 unsafe fn begin_edit(task: &crate::store::Task) {
     let s = st();
     s.input_visible = true;
@@ -359,6 +378,7 @@ unsafe fn begin_edit(task: &crate::store::Task) {
     s.input_caret = buf_char_count(&s.input_buffer);
     s.sel_anchor = None;
     s.text_dragging = false;
+    s.input_priority = task.level();
     let hwnd = s.hwnd;
     SetFocus(hwnd);
     reset_caret(hwnd, s);
@@ -636,7 +656,11 @@ unsafe extern "system" fn task_wndproc(
                 return LRESULT(0);
             }
             if s.input_visible && p.y >= TITLE_H + HEADER_H && p.y < TITLE_H + HEADER_H + INPUT_H {
-                if in_rect(chip_rect(s), p) {
+                if in_rect(prio_chip_rect(s), p) {
+                    s.input_priority = (s.input_priority + 1) % 3;
+                    invalidate_input(hwnd);
+                    reset_caret(hwnd, s);
+                } else if in_rect(chip_rect(s), p) {
                     toggle_calendar(hwnd);
                 } else {
                     SetFocus(hwnd);
@@ -715,7 +739,11 @@ unsafe extern "system" fn task_wndproc(
                 } else if p.y < TITLE_H + HEADER_H {
                     if p.x > WIN_W - 60 { IDC_HAND } else { IDC_ARROW }
                 } else if s.input_visible && p.y < TITLE_H + HEADER_H + INPUT_H {
-                    if in_rect(chip_rect(s), p) { IDC_HAND } else { IDC_IBEAM }
+                    if in_rect(chip_rect(s), p) || in_rect(prio_chip_rect(s), p) {
+                        IDC_HAND
+                    } else {
+                        IDC_IBEAM
+                    }
                 } else if over_card_action(s, p.x, p.y) {
                     IDC_HAND
                 } else {
@@ -827,13 +855,14 @@ unsafe extern "system" fn task_wndproc(
                         if !title.is_empty() {
                             let date = s.input_date.clone();
                             let editing = s.editing_id.clone();
+                            let priority = s.input_priority;
                             let mut store = s.store.lock().unwrap();
                             match editing {
                                 Some(id) => {
-                                    store.update(&id, &title, date.as_deref());
+                                    store.update(&id, &title, date.as_deref(), priority);
                                 }
                                 None => {
-                                    store.add(&title, date.as_deref());
+                                    store.add(&title, date.as_deref(), priority);
                                 }
                             }
                         }
@@ -942,7 +971,8 @@ unsafe fn paint(hwnd: HWND) {
         let text = if s.input_buffer.is_empty() { "输入新任务..." } else { &s.input_buffer };
         let color = if s.input_buffer.is_empty() { rgb(150, 150, 150) } else { rgb(C_TEXT.0, C_TEXT.1, C_TEXT.2) };
         let chip = chip_rect(s);
-        let txt_rc = RECT { left: 20 + 12, top: in_y + 5, right: chip.left - 8, bottom: in_y + INPUT_H - 5 };
+        let prio = prio_chip_rect(s);
+        let txt_rc = RECT { left: 20 + 12, top: in_y + 5, right: prio.left - 8, bottom: in_y + INPUT_H - 5 };
 
         // 选区高亮（铺在文字下方）
         if let Some((a, b)) = sel_range(s) {
@@ -990,6 +1020,19 @@ unsafe fn paint(hwnd: HWND) {
         };
         gdi::draw_text(mem, &label, chip, chip_text_color,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE, s.font_date);
+
+        // 重要性按钮：0 默认（灰）、1 重要（黄）、2 非常重要（红），点击循环切换
+        let (prio_border, prio_text) = match s.input_priority {
+            1 => (C_PRIO_1, C_PRIO_1),
+            2 => (C_PRIO_2, C_PRIO_2),
+            _ => (C_BORDER, (150, 150, 150)),
+        };
+        gdi::round_rect_aa(bits as *mut u32, WIN_W, full, prio, 9.0,
+            rgb(C_WHITE.0, C_WHITE.1, C_WHITE.2),
+            rgb(prio_border.0, prio_border.1, prio_border.2), 1.0);
+        let bang = RECT { left: prio.left, top: prio.top + 3, right: prio.right, bottom: prio.bottom - 3 };
+        gdi::draw_bang_aa(bits as *mut u32, WIN_W, full, bang,
+            rgb(prio_text.0, prio_text.1, prio_text.2));
 
         // 自绘插入光标（1px 竖线，闪烁节奏与系统一致）
         if s.caret_on && caret_active(hwnd, s) {
@@ -1089,6 +1132,7 @@ unsafe fn draw_card(
     let text_color = if task.completed { C_MUTED } else { C_TEXT };
     let font = if task.completed { s.font_item_done } else { s.font_item };
     let date_txt = task.display_date();
+    let level = task.level();
     // 日期用 TextOut 精确右对齐（不做矩形裁剪，杜绝字形被切掉）
     let date_right = WIN_W - MARGIN_X - 24 - 12 - 6;
     let (date_w, date_h) = match &date_txt {
@@ -1102,14 +1146,38 @@ unsafe fn draw_card(
         }
         None => (0, 0),
     };
-    let title_right = if date_txt.is_some() {
-        date_right - date_w - 10
+    // 右侧从右往左依次排：日期 → 重要性感叹号 → 标题
+    let mut right_edge = date_right;
+    if date_txt.is_some() {
+        right_edge = date_right - date_w - 6;
+    }
+    let badge = if level > 0 {
+        let cy = y + CARD_H / 2;
+        let rc = RECT { left: right_edge - 18, top: cy - 9, right: right_edge, bottom: cy + 9 };
+        right_edge = rc.left - 6;
+        Some(rc)
+    } else {
+        None
+    };
+    let title_right = if date_txt.is_some() || level > 0 {
+        right_edge
     } else {
         WIN_W - MARGIN_X - 50
     };
     let txt = RECT { left: MARGIN_X + 15 + 34, top: y, right: title_right, bottom: y + CARD_H };
     gdi::draw_text(hdc, &task.title, txt, rgb(text_color.0, text_color.1, text_color.2),
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, font);
+
+    // 重要性感叹号：1 黄色、2 红色
+    if let Some(rc) = badge {
+        let (bg, fg) = if level == 1 {
+            (C_PRIO_1_BG, C_PRIO_1)
+        } else {
+            (C_PRIO_2_BG, C_PRIO_2)
+        };
+        gdi::fill_ellipse_aa(px, WIN_W, clip, rc, rgb(bg.0, bg.1, bg.2));
+        gdi::draw_bang_aa(px, WIN_W, clip, rc, rgb(fg.0, fg.1, fg.2));
+    }
 
     // 设定了日期的任务，在标题右侧显示 26-11-08
     if let Some(d) = date_txt {

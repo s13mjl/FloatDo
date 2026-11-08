@@ -16,6 +16,13 @@ pub struct Task {
     /// 设定的日期（YYYY-MM-DD）。未设定时为 None：文件里不写该字段，卡片上也不显示。
     #[serde(rename = "due_date", default, skip_serializing_if = "Option::is_none")]
     pub due_date: Option<String>,
+    /// 重要性：0 默认（不显示）、1 重要、2 非常重要。
+    #[serde(rename = "priority", default, skip_serializing_if = "priority_is_zero")]
+    pub priority: u8,
+}
+
+fn priority_is_zero(p: &u8) -> bool {
+    *p == 0
 }
 
 /// 今天的日期（YYYY-MM-DD）。未设定日期的任务用它参与排序，随系统日期动态变化。
@@ -34,6 +41,11 @@ impl Task {
     /// 卡片右侧显示的日期；未设定日期则不显示。
     pub fn display_date(&self) -> Option<String> {
         self.due_date.as_deref().map(short_date)
+    }
+
+    /// 重要性等级（0/1/2，越界按 2 处理）。
+    pub fn level(&self) -> u8 {
+        self.priority.min(2)
     }
 }
 
@@ -78,7 +90,7 @@ impl TaskStore {
         }
     }
 
-    pub fn add(&mut self, title: &str, due_date: Option<&str>) -> Task {
+    pub fn add(&mut self, title: &str, due_date: Option<&str>, priority: u8) -> Task {
         let now = chrono::Local::now();
         let task = Task {
             id: now.format("%Y%m%d%H%M%S%.6f").to_string(),
@@ -86,6 +98,7 @@ impl TaskStore {
             completed: false,
             created_at: now.format("%Y-%m-%d %H:%M:%S").to_string(),
             due_date: due_date.map(|d| d.to_string()),
+            priority: priority.min(2),
         };
         self.tasks.push(task.clone());
         self.save();
@@ -101,11 +114,18 @@ impl TaskStore {
         false
     }
 
-    /// 修改已有任务的标题与日期；未找到返回 false。
-    pub fn update(&mut self, id: &str, title: &str, due_date: Option<&str>) -> bool {
+    /// 修改已有任务的标题、日期与重要性；未找到返回 false。
+    pub fn update(
+        &mut self,
+        id: &str,
+        title: &str,
+        due_date: Option<&str>,
+        priority: u8,
+    ) -> bool {
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
             t.title = title.to_string();
             t.due_date = due_date.map(|d| d.to_string());
+            t.priority = priority.min(2);
             self.save();
             return true;
         }
@@ -121,13 +141,23 @@ impl TaskStore {
         self.tasks.len()
     }
 
-    /// 列表视图：日期早的排在上面，晚的在下面；
-    /// 同一日期的任务保持添加先后顺序（稳定排序）；
-    /// 未设定日期的任务按「今天」参与排序。
+    /// 列表视图排序规则：
+    /// 1) 非常重要的任务置顶，彼此按日期升序、同日按添加先后；
+    /// 2) 其余任务按日期升序，同一天里「重要」排在「默认」之前，同级按添加先后；
+    /// 3) 未设定日期的任务按「今天」参与排序。
     pub fn all(&self) -> Vec<Task> {
         let today = today();
         let mut tasks = self.tasks.clone();
-        tasks.sort_by_cached_key(|t| t.due_date.clone().unwrap_or_else(|| today.clone()));
+        tasks.sort_by_cached_key(|t| {
+            let lvl = t.level();
+            let group = if lvl == 2 { 0u8 } else { 1u8 };
+            let sub = if lvl == 1 { 0u8 } else { 1u8 };
+            (
+                group,
+                t.due_date.clone().unwrap_or_else(|| today.clone()),
+                sub,
+            )
+        });
         tasks
     }
 }
