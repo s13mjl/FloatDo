@@ -100,6 +100,8 @@ pub struct TaskWinState {
     pub font_btn: HFONT,
     pub font_date: HFONT,
     pub scroll_y: i32,
+    /// 滚轮余量（单位：delta × 像素），用于累积触控板的细碎滚动量。
+    pub wheel_accum: i32,
     pub caret_on: bool,
     /// 复用的离屏位图内存 DC（DIB 由它长期持有）。
     pub mem_dc: HDC,
@@ -191,6 +193,7 @@ pub fn create(store: Arc<Mutex<TaskStore>>) {
             font_btn,
             font_date,
             scroll_y: 0,
+            wheel_accum: 0,
             caret_on: false,
             mem_dc,
             dib_bits,
@@ -912,10 +915,21 @@ unsafe extern "system" fn task_wndproc(
         WM_MOUSEWHEEL => {
             let s = st();
             let delta = ((wparam.0 >> 16) as i16) as i32;
-            let step = -delta / 120 * (CARD_H + CARD_GAP);
             let maxs = scroll_max(s.store.lock().unwrap().count(), list_top(s));
-            s.scroll_y = (s.scroll_y + step).clamp(0, maxs);
-            InvalidateRect(hwnd, None, false);
+            // 触控板平滑滚动每次只发很小的 delta（常远小于 120），
+            // 直接 delta/120 会被整数除法截断成 0 导致几乎不动；
+            // 这里把余量累积起来换算成像素位移，滚动手感才连续
+            let unit = CARD_H + CARD_GAP;
+            let acc = s.wheel_accum + delta * unit;
+            let px = acc / 120;
+            let target = s.scroll_y - px;
+            let new_y = target.clamp(0, maxs);
+            // 已到边界时丢掉余量，避免反向滚动时出现迟滞
+            s.wheel_accum = if new_y == target { acc - px * 120 } else { 0 };
+            if new_y != s.scroll_y {
+                s.scroll_y = new_y;
+                InvalidateRect(hwnd, None, false);
+            }
             LRESULT(0)
         }
         WM_KEYDOWN => {
