@@ -52,7 +52,13 @@ impl Task {
 pub struct TaskStore {
     file_path: PathBuf,
     tasks: Vec<Task>,
+    /// 撤销/重做历史（整表快照，任务量小，实现简单且不会漏状态）。
+    undo_stack: Vec<Vec<Task>>,
+    redo_stack: Vec<Vec<Task>>,
 }
+
+/// 历史最多保留的步数。
+const MAX_HISTORY: usize = 100;
 
 impl TaskStore {
     /// 任务文件放在 exe 同目录下。
@@ -67,6 +73,8 @@ impl TaskStore {
         let mut store = TaskStore {
             file_path,
             tasks: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         };
         store.load();
         store
@@ -90,7 +98,37 @@ impl TaskStore {
         }
     }
 
+    /// 在修改任务前记录快照，供撤销使用。
+    fn record(&mut self) {
+        self.undo_stack.push(self.tasks.clone());
+        if self.undo_stack.len() > MAX_HISTORY {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+
+    /// 撤销上一步修改；返回是否真的改变了数据。
+    pub fn undo(&mut self) -> bool {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.redo_stack.push(std::mem::replace(&mut self.tasks, prev));
+            self.save();
+            return true;
+        }
+        false
+    }
+
+    /// 重做被撤销的修改；返回是否真的改变了数据。
+    pub fn redo(&mut self) -> bool {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(std::mem::replace(&mut self.tasks, next));
+            self.save();
+            return true;
+        }
+        false
+    }
+
     pub fn add(&mut self, title: &str, due_date: Option<&str>, priority: u8) -> Task {
+        self.record();
         let now = chrono::Local::now();
         let task = Task {
             id: now.format("%Y%m%d%H%M%S%.6f").to_string(),
@@ -106,8 +144,11 @@ impl TaskStore {
     }
 
     pub fn toggle(&mut self, id: &str) -> bool {
-        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
-            t.completed = !t.completed;
+        if self.tasks.iter().any(|t| t.id == id) {
+            self.record();
+            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+                t.completed = !t.completed;
+            }
             self.save();
             return true;
         }
@@ -122,10 +163,13 @@ impl TaskStore {
         due_date: Option<&str>,
         priority: u8,
     ) -> bool {
-        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
-            t.title = title.to_string();
-            t.due_date = due_date.map(|d| d.to_string());
-            t.priority = priority.min(2);
+        if self.tasks.iter().any(|t| t.id == id) {
+            self.record();
+            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+                t.title = title.to_string();
+                t.due_date = due_date.map(|d| d.to_string());
+                t.priority = priority.min(2);
+            }
             self.save();
             return true;
         }
@@ -133,8 +177,11 @@ impl TaskStore {
     }
 
     pub fn delete(&mut self, id: &str) {
-        self.tasks.retain(|t| t.id != id);
-        self.save();
+        if self.tasks.iter().any(|t| t.id == id) {
+            self.record();
+            self.tasks.retain(|t| t.id != id);
+            self.save();
+        }
     }
 
     pub fn count(&self) -> usize {

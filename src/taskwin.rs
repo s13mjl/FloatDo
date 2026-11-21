@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_A, VK_CONTROL, VK_DELETE,
-    VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT, VK_SHIFT,
+    VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT, VK_SHIFT, VK_Y, VK_Z,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
@@ -935,11 +935,26 @@ unsafe extern "system" fn task_wndproc(
         WM_KEYDOWN => {
             let mut handled = false;
             let s = st();
+            let vk = wparam.0 as u16;
+            let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+            let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+            // 任务撤销 / 重做：Ctrl+Z、Ctrl+Y、Ctrl+Shift+Z
+            // 输入框打开时让位给文本编辑，避免与正在编辑的内容冲突
+            if !s.input_visible && ctrl && (vk == VK_Z.0 || vk == VK_Y.0) {
+                let is_undo = vk == VK_Z.0 && !shift;
+                let changed = {
+                    let mut store = s.store.lock().unwrap();
+                    if is_undo { store.undo() } else { store.redo() }
+                };
+                if changed {
+                    let maxs = scroll_max(s.store.lock().unwrap().count(), list_top(s));
+                    s.scroll_y = s.scroll_y.clamp(0, maxs);
+                    InvalidateRect(hwnd, None, false);
+                }
+                return LRESULT(0);
+            }
             if s.input_visible {
-                let vk = wparam.0 as u16;
                 let len = buf_char_count(&s.input_buffer);
-                let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
-                let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
                 let old_caret = s.input_caret;
                 let mut moved = false;
                 if vk == VK_LEFT.0 {
