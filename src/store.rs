@@ -189,9 +189,10 @@ impl TaskStore {
     }
 
     /// 列表视图排序规则：
-    /// 1) 非常重要的任务置顶，彼此按日期升序、同日按添加先后；
-    /// 2) 其余任务按日期升序，同一天里「重要」排在「默认」之前，同级按添加先后；
-    /// 3) 未设定日期的任务按「今天」参与排序。
+    /// 1) 未完成的任务全部排在已完成任务之上；
+    /// 2) 两个分区内部规则相同：非常重要置顶，彼此按日期升序、同日按添加先后；
+    /// 3) 其余任务按日期升序，同一天里「重要」排在「默认」之前，同级按添加先后；
+    /// 4) 未设定日期的任务按「今天」参与排序。
     pub fn all(&self) -> Vec<Task> {
         let today = today();
         let mut tasks = self.tasks.clone();
@@ -200,6 +201,7 @@ impl TaskStore {
             let group = if lvl == 2 { 0u8 } else { 1u8 };
             let sub = if lvl == 1 { 0u8 } else { 1u8 };
             (
+                t.completed,
                 group,
                 t.due_date.clone().unwrap_or_else(|| today.clone()),
                 sub,
